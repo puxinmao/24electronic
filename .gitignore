@@ -1,0 +1,37 @@
+# 编译输出
+Debug/
+Release/
+
+# 编译器/链接器生成文件
+*.o
+*.d
+*.out
+*.map
+*.hex
+*.bin
+*.lst
+*.obj
+*.elf
+*.lib
+*.a
+
+# IDE 缓存
+.clangd/
+.clangd/.cache/
+.settings/
+
+# CCS 工程备份
+*.bak
+*.swp
+
+# 项目备份
+第一版.zip
+
+# IDE/编辑器配置
+.theia/
+.codex/
+.reasonix/
+
+# 系统文件
+Thumbs.db
+.DS_Store
