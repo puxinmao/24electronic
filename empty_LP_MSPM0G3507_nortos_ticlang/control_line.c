@@ -47,6 +47,11 @@ void Line_Stop(void)
     Motor_Standby();
 }
 
+void Line_SetBaseSpeed(int16_t speed)
+{
+    sBaseSpeed = speed;
+}
+
 float Line_GetPosition(uint8_t gray_map)
 {
     int16_t sw = 0, sn = 0;

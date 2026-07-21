@@ -42,8 +42,8 @@ float Straight_Update(float current_yaw)
 {
     if (!sRunning) return 0.0f;
 
-    float err = yaw_error_norm(current_yaw, sTargetYaw);
-    float corr = PID_Compute(&sPid, current_yaw, 0.01f);
+    float err  = yaw_error_norm(current_yaw, sTargetYaw);   /* cur-tgt，用于返回显示 */
+    float corr = PID_ComputeError(&sPid, -err, 0.01f);       /* PID 使用归一化的 tgt-cur */
 
     int16_t left  = sBaseSpeed + (int16_t)corr;
     int16_t right = sBaseSpeed - (int16_t)corr;

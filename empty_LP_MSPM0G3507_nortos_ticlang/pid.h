@@ -29,6 +29,9 @@ void PID_SetSetpoint(PID_t *pid, float setpoint);
 /* 计算 PID 输出 (dt = 调用间隔，单位秒) */
 float PID_Compute(PID_t *pid, float measurement, float dt);
 
+/* 用预算好的误差计算 PID 输出（适用于需要归一化误差的场合，如偏航角） */
+float PID_ComputeError(PID_t *pid, float error, float dt);
+
 /* 复位 PID（清除积分和上次误差） */
 void PID_Reset(PID_t *pid);
 

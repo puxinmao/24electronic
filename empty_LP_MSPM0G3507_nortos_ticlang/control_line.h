@@ -21,6 +21,9 @@ void Line_Update(uint8_t gray_map);
 /* 停止 */
 void Line_Stop(void);
 
+/* 运行时调整基础速度（不重置 PID） */
+void Line_SetBaseSpeed(int16_t speed);
+
 /* 获取调试信息 */
 float Line_GetPosition(uint8_t gray_map);
 float Line_GetError(void);

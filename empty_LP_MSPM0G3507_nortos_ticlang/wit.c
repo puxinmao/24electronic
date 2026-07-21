@@ -38,11 +38,11 @@ static void wit_parse_packet(const uint8_t *pkt)
         wit_data.pitch = (int16_t)((pkt[5] << 8) | pkt[4]) / 32768.0f * 180.0f;
         wit_data.yaw   = (int16_t)((pkt[7] << 8) | pkt[6]) / 32768.0f * 180.0f;
         wit_data.version = (int16_t)((pkt[9] << 8) | pkt[8]);
+        g_wit_updated = true;
         break;
     default:
         break;
     }
-    g_wit_updated = true;
 }
 
 /* ========== 公开接口 ========== */

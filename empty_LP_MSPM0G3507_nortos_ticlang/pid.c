@@ -54,3 +54,29 @@ void PID_Reset(PID_t *pid)
     pid->integral   = 0.0f;
     pid->prev_error = 0.0f;
 }
+
+float PID_ComputeError(PID_t *pid, float error, float dt)
+{
+    float output;
+
+    /* P 项 */
+    output = pid->Kp * error;
+
+    /* I 项（带限幅） */
+    pid->integral += error * dt;
+    if (pid->integral >  pid->integral_limit) pid->integral =  pid->integral_limit;
+    if (pid->integral < -pid->integral_limit) pid->integral = -pid->integral_limit;
+    output += pid->Ki * pid->integral;
+
+    /* D 项 */
+    if (dt > 1e-6f) {
+        output += pid->Kd * (error - pid->prev_error) / dt;
+    }
+    pid->prev_error = error;
+
+    /* 输出限幅 */
+    if (output > pid->out_max) output = pid->out_max;
+    if (output < pid->out_min) output = pid->out_min;
+
+    return output;
+}
