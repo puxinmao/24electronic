@@ -18,10 +18,22 @@
 
 #include <stdio.h>
 
+#define KEY_WAIT_TIMEOUT 300       /* 按键释放超时 (ms) */
+
 /* ========== 延时 ========== */
 static void delay_ms(uint32_t ms)
 {
     while (ms--) { delay_cycles(CPUCLK_FREQ / 1000); }
+}
+
+/* 等待引脚释放，超时 300ms 强制退出 */
+static void wait_key_release(GPIO_Regs *port, uint32_t pin)
+{
+    uint32_t t = KEY_WAIT_TIMEOUT;
+    while (DL_GPIO_readPins(port, pin) == 0 && t > 0) {
+        delay_ms(1);
+        t--;
+    }
 }
 
 /* ========== 运行模式 ========== */
@@ -160,7 +172,7 @@ int main(void)
          * ============================================================ */
         if (g_running && g_mode == MODE_LINE) {
 
-            if (g_line_phase == 0) {
+            if (g_line_phase == 0 && wit_new) {
                 /* ---- 阶段 0: 偏航直行，等黑线 ---- */
                 float yaw_err = yaw_error_norm(wit.yaw, g_target_yaw);
                 float corr = PID_Compute(&gPidYaw, wit.yaw, 0.01f);
@@ -230,8 +242,7 @@ int main(void)
                 OLED_ShowString(3, 7, (uint8_t *)g_buf, 8);
                 DBG_Printf("GO YAW T:%.1f\r\n", g_target_yaw);
 
-                while (DL_GPIO_readPins(GPIO_IO_KEY1_PORT,
-                       GPIO_IO_KEY1_PIN) == 0) {}
+                wait_key_release(GPIO_IO_KEY1_PORT, GPIO_IO_KEY1_PIN);
             }
         }
 
@@ -257,8 +268,7 @@ int main(void)
                 DBG_SendNum(Encoder_GetRight());
                 DBG_SendStr("\r\n");
 
-                while (DL_GPIO_readPins(GPIO_IO_KEY2_PORT,
-                       GPIO_IO_KEY2_PIN) == 0) {}
+                wait_key_release(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN);
             }
         }
 
@@ -283,8 +293,7 @@ int main(void)
                 OLED_ShowString(3, 7, (uint8_t *)g_buf, 8);
                 DBG_Printf("GO LINE T:%.1f\r\n", g_target_yaw);
 
-                while (DL_GPIO_readPins(GPIO_IO_KEY3_PORT,
-                       GPIO_IO_KEY3_PIN) == 0) {}
+                wait_key_release(GPIO_IO_KEY3_PORT, GPIO_IO_KEY3_PIN);
             }
         }
     }
