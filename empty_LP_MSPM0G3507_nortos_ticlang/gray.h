@@ -21,4 +21,7 @@ uint8_t Gray_Read(void);
 /* 依次读取 8 个通道，返回 8-bit 位图 (bit0 = CH0) */
 uint8_t Gray_ReadAll(void);
 
+/* 统计位图中看到黑色的路数 */
+int Gray_BlackCount(uint8_t map);
+
 #endif /* GRAY_H */

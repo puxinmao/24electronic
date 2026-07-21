@@ -34,7 +34,7 @@ void Gray_SelectChannel(uint8_t ch)
     else
         DL_GPIO_clearPins(GPIO_GRAY_PORT, GPIO_GRAY_AD2_PIN);
 
-    delay_us(10); /* 等待 CD4051 切换 */
+    delay_us(20); /* 等待 CD4051 切换（加长至 20us 确保稳定） */
 }
 
 uint8_t Gray_Read(void)
@@ -53,4 +53,11 @@ uint8_t Gray_ReadAll(void)
         }
     }
     return result;
+}
+
+int Gray_BlackCount(uint8_t map)
+{
+    int n = 0;
+    for (int i = 0; i < 8; i++) if (map & (1 << i)) n++;
+    return n;
 }

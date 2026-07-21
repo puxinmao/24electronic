@@ -1,0 +1,65 @@
+/*
+ * control_straight.c - 偏航角直行实现
+ */
+#include "control_straight.h"
+#include "pid.h"
+#include "motor.h"
+#include "ti_msp_dl_config.h"
+
+static PID_t  sPid;
+static float  sTargetYaw = 0.0f;
+static int16_t sBaseSpeed = 700;
+static bool   sRunning = false;
+
+/* ========== 内部辅助 ========== */
+
+static float yaw_error_norm(float cur, float tgt)
+{
+    float e = cur - tgt;
+    while (e >  180.0f) e -= 360.0f;
+    while (e < -180.0f) e += 360.0f;
+    return e;
+}
+
+/* ========== 公开接口 ========== */
+
+void Straight_Config(float kp, float ki, float kd, int16_t base_speed)
+{
+    PID_Init(&sPid, kp, ki, kd, -600, 600, 400);
+    sBaseSpeed = base_speed;
+}
+
+void Straight_Start(float current_yaw)
+{
+    sTargetYaw = current_yaw;
+    PID_Reset(&sPid);
+    PID_SetSetpoint(&sPid, sTargetYaw);
+    Motor_Enable();
+    sRunning = true;
+}
+
+float Straight_Update(float current_yaw)
+{
+    if (!sRunning) return 0.0f;
+
+    float err = yaw_error_norm(current_yaw, sTargetYaw);
+    float corr = PID_Compute(&sPid, current_yaw, 0.01f);
+
+    int16_t left  = sBaseSpeed + (int16_t)corr;
+    int16_t right = sBaseSpeed - (int16_t)corr;
+    if (left  < 0) left  = 0;
+    if (right < 0) right = 0;
+    Motor_SetBoth(left, right);
+
+    return err;
+}
+
+void Straight_Stop(void)
+{
+    sRunning = false;
+    Motor_Brake();
+    Motor_Standby();
+}
+
+float Straight_GetTarget(void) { return sTargetYaw; }
+bool  Straight_IsRunning(void) { return sRunning; }
