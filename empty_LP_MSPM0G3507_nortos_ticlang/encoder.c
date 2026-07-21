@@ -10,6 +10,7 @@
  *       全部在 GPIOB 上，双边沿触发
  */
 #include "encoder.h"
+#include "button.h"
 #include "ti_msp_dl_config.h"
 
 /* 编码器状态 */
@@ -104,6 +105,9 @@ void Encoder_Reset(void)
 
 void GROUP1_IRQHandler(void)
 {
+    /* GPIOA and GPIOB share GROUP1. KEY2 emergency stop has priority. */
+    (void)Button_EStopHandleIRQ();
+
     uint32_t status = DL_GPIO_getEnabledInterruptStatus(GPIOB,
         DL_GPIO_PIN_0 | DL_GPIO_PIN_7 | DL_GPIO_PIN_6 | DL_GPIO_PIN_16);
 

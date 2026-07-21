@@ -35,4 +35,10 @@ void WIT_Init(void);
 /* 获取最新数据（非阻塞，无新数据返回 false） */
 bool WIT_GetData(WIT_Data_t *dst);
 
+/* UART 噪声导致接收异常时返回 true */
+bool WIT_HasFault(void);
+
+/* 清空接收状态并重新开启 UART 中断 */
+void WIT_Recover(void);
+
 #endif

@@ -18,6 +18,7 @@
 #include "gray.h"
 #include "oled.h"
 #include "wit.h"
+#include "button.h"
 
 #include <stdio.h>
 
@@ -34,6 +35,10 @@ static uint8_t  g_turn_brake_frames = 0;
 static uint16_t g_turn_frames = 0;
 static bool     g_turn_braking = false;
 static bool     g_key4_armed = true;
+static bool     g_wit_ready = false;
+static uint16_t g_wit_silent_loops = 0;
+static uint16_t g_line_lost_frames = 0;
+static float    g_latest_yaw = 0.0f;
 
 #define LINE_SPEED_NORMAL  700   /* 正常循迹速度 */
 #define LINE_SPEED_ENTRY   1000  /* 入场减速速度（反向PWM，值大=慢） */
@@ -47,6 +52,7 @@ static bool     g_key4_armed = true;
 #define TURN_SLOW_ANGLE      10.0f
 #define TURN_BRAKE_FRAMES       10  /* 刹车后等待约 100ms 再开始直行 */
 #define TURN_TIMEOUT_FRAMES    300  /* 约 3 秒（JY901S 姿态角 100Hz） */
+#define WIT_LOSS_LOOP_LIMIT   2000  /* No valid attitude frame for roughly 0.3 s. */
 
 #define OLED_CLR(l) OLED_ShowString(3, l, (uint8_t *)"            ", 8)
 
@@ -70,6 +76,38 @@ static float yaw_norm(float yaw)
     return yaw;
 }
 
+static bool state_uses_wit(State_t state)
+{
+    return state == S_YAW || state == S_TURN_IN_PLACE ||
+           state == S_LINE_STRAIGHT;
+}
+
+static void stop_vehicle(void)
+{
+    Straight_Stop();
+    Line_Stop();
+    Line_SetBaseSpeed(LINE_SPEED_NORMAL);
+    g_state = S_IDLE;
+    g_track_entry = 0;
+    g_line_lost_frames = 0;
+    g_turn_braking = false;
+    g_wit_silent_loops = 0;
+}
+
+static bool wit_can_start(void)
+{
+    if (WIT_HasFault()) {
+        WIT_Recover();
+        g_wit_ready = false;
+    }
+
+    if (g_wit_ready && !Button_EStopIsPending()) return true;
+
+    OLED_ShowString(3, 7, (uint8_t *)"WIT WAIT  ", 8);
+    DBG_SendStr("START BLOCKED: WIT NOT READY\r\n");
+    return false;
+}
+
 /* ========== main ========== */
 int main(void)
 {
@@ -80,6 +118,7 @@ int main(void)
     Motor_Standby();
     DL_TimerA_startCounter(PWM_INST);
     Encoder_Init();
+    Button_EStopInit();
     Gray_Init();
 
     Straight_Config(50.0f, 0.2f, 8.0f,  700);
@@ -92,10 +131,54 @@ int main(void)
     DBG_SendStr("Ready\r\n");
 
     while (1) {
+        if (Button_EStopTakeEvent()) {
+            stop_vehicle();
+            WIT_Recover();
+            g_wit_ready = false;
+            OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
+            OLED_ShowString(3, 7, (uint8_t *)"STOP      ", 8);
+            DBG_SendStr("EMERGENCY STOP\r\n");
+            continue;
+        }
+
+        if (WIT_HasFault()) {
+            stop_vehicle();
+            WIT_Recover();
+            g_wit_ready = false;
+            OLED_ShowString(3, 7, (uint8_t *)"WIT ERROR ", 8);
+            DBG_SendStr("STOP WIT UART FAULT\r\n");
+            continue;
+        }
+
         WIT_Data_t wit;
         bool wit_new = WIT_GetData(&wit);
         uint8_t gray_map = Gray_ReadAll();
         g_cnt++;
+
+        if (wit_new) {
+            g_latest_yaw = wit.yaw;
+            g_wit_ready = true;
+            g_wit_silent_loops = 0;
+        } else if (g_wit_ready &&
+                   g_wit_silent_loops < WIT_LOSS_LOOP_LIMIT) {
+            g_wit_silent_loops++;
+        }
+
+        if (g_state == S_IDLE &&
+            g_wit_silent_loops >= WIT_LOSS_LOOP_LIMIT) {
+            g_wit_ready = false;
+        }
+
+        if (state_uses_wit(g_state) &&
+            g_wit_silent_loops >= WIT_LOSS_LOOP_LIMIT) {
+            stop_vehicle();
+            WIT_Recover();
+            g_wit_ready = false;
+            OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
+            OLED_ShowString(3, 7, (uint8_t *)"WIT LOST  ", 8);
+            DBG_SendStr("STOP WIT DATA LOST\r\n");
+            continue;
+        }
 
         /* ---- OLED 角度 ---- */
         if (wit_new) {
@@ -186,10 +269,12 @@ int main(void)
 
             /* 黑线检测：每圈都查，不依赖 wit_new */
             if (Gray_BlackCount(gray_map) >= LINE_DETECT_MIN) {
+                Straight_Stop();
                 Line_SetBaseSpeed(LINE_SPEED_ENTRY); /* 先以慢速入场 */
                 Line_Start();
                 g_state = S_LINE_TRACK;
                 g_track_entry = LINE_ENTRY_FRAMES;
+                g_line_lost_frames = 0;
                 OLED_ShowString(3, 7, (uint8_t *)"LINE TRACK", 8);
                 DBG_Printf("-> LINE TRACK G:0x%02X\r\n", gray_map);
             }
@@ -208,18 +293,17 @@ int main(void)
             Line_Update(gray_map);
 
             /* 丢线检测：连续 50 帧无线（灯全灭）自动停止 */
-            static uint16_t lost_cnt = 0;
             if (gray_map == 0) {
-                if (++lost_cnt >= 50) {
+                if (++g_line_lost_frames >= 50) {
                     Line_Stop();
                     g_state = S_IDLE;
-                    lost_cnt = 0;
+                    g_line_lost_frames = 0;
                     OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
                     OLED_ShowString(3, 7, (uint8_t *)"LOST LINE ", 8);
                     DBG_SendStr("STOP LOST LINE\r\n");
                 }
             } else {
-                lost_cnt = 0;
+                g_line_lost_frames = 0;
             }
 
             /* 降低 OLED/UART 刷新频率，避免阻塞导致循环计时抖动 */
@@ -239,10 +323,13 @@ int main(void)
 
         /* KEY1 → 偏航直行 + 黑停 */
         if (DL_GPIO_readPins(GPIO_IO_KEY1_PORT, GPIO_IO_KEY1_PIN) == 0) {
-            float snap_yaw = wit_data.yaw;  /* 第一时间记录，不受消抖延时影响 */
+            float snap_yaw = g_latest_yaw;
             delay_ms(50);
-            if (DL_GPIO_readPins(GPIO_IO_KEY1_PORT, GPIO_IO_KEY1_PIN) == 0) {
+            if (DL_GPIO_readPins(GPIO_IO_KEY1_PORT, GPIO_IO_KEY1_PIN) == 0 &&
+                DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) != 0 &&
+                wit_can_start()) {
                 Straight_Start(snap_yaw);
+                g_wit_silent_loops = 0;
                 g_state = S_YAW;
                 OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
                 sprintf(g_buf, "YAW T:%.0f", Straight_GetTarget());
@@ -254,30 +341,15 @@ int main(void)
             }
         }
 
-        /* KEY2 → 停止（第一次检测到按下立即执行） */
-        if (DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) == 0) {
-            if (g_state == S_LINE_TRACK) Line_Stop();
-            else Straight_Stop();
-            g_state = S_IDLE;
-            g_turn_braking = false;
-            OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
-            OLED_ShowString(3, 7, (uint8_t *)"STOP      ", 8);
-            DBG_SendStr("STOP L:");
-            DBG_SendNum(Encoder_GetLeft());
-            DBG_SendStr(" R:");
-            DBG_SendNum(Encoder_GetRight());
-            DBG_SendStr("\r\n");
-            uint32_t t = 300;
-            while (DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) == 0
-                   && t > 0) { delay_ms(1); t--; }
-        }
-
         /* KEY3 → 直行→循迹 */
         if (DL_GPIO_readPins(GPIO_IO_KEY3_PORT, GPIO_IO_KEY3_PIN) == 0) {
-            float snap_yaw = wit_data.yaw;  /* 第一时间记录 */
+            float snap_yaw = g_latest_yaw;
             delay_ms(50);
-            if (DL_GPIO_readPins(GPIO_IO_KEY3_PORT, GPIO_IO_KEY3_PIN) == 0) {
+            if (DL_GPIO_readPins(GPIO_IO_KEY3_PORT, GPIO_IO_KEY3_PIN) == 0 &&
+                DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) != 0 &&
+                wit_can_start()) {
                 Straight_Start(snap_yaw);
+                g_wit_silent_loops = 0;
                 g_state = S_LINE_STRAIGHT;
                 OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
                 sprintf(g_buf, "YAW T:%.0f", Straight_GetTarget());
@@ -292,9 +364,11 @@ int main(void)
         /* KEY4 → 原地转向 38°，完成后复用 KEY3 的直行→循迹流程 */
         if (g_key4_armed &&
             DL_GPIO_readPins(GPIO_IO_KEY4_PORT, GPIO_IO_KEY4_PIN) == 0) {
-            float snap_yaw = wit_data.yaw;  /* 第一时间记录 */
+            float snap_yaw = g_latest_yaw;
             delay_ms(50);
-            if (DL_GPIO_readPins(GPIO_IO_KEY4_PORT, GPIO_IO_KEY4_PIN) == 0) {
+            if (DL_GPIO_readPins(GPIO_IO_KEY4_PORT, GPIO_IO_KEY4_PIN) == 0 &&
+                DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) != 0 &&
+                wit_can_start()) {
                 g_key4_armed = false;
                 g_turn_target = yaw_norm(snap_yaw - TURN_ANGLE_DEG);
                 g_turn_last_yaw = snap_yaw;
@@ -302,6 +376,7 @@ int main(void)
                 g_turn_brake_frames = 0;
                 g_turn_frames = 0;
                 g_turn_braking = false;
+                g_wit_silent_loops = 0;
                 Motor_Enable();
                 Motor_SetBoth(TURN_PWM_FAST, -TURN_PWM_FAST);
                 g_state = S_TURN_IN_PLACE;

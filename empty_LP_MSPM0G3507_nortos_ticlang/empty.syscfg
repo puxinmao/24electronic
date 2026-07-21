@@ -54,6 +54,8 @@ GPIO2.associatedPins[0].pin.$assign      = "PB13";
 GPIO2.associatedPins[1].$name            = "KEY2";
 GPIO2.associatedPins[1].internalResistor = "PULL_UP";
 GPIO2.associatedPins[1].direction        = "INPUT";
+GPIO2.associatedPins[1].interruptEn      = true;
+GPIO2.associatedPins[1].polarity         = "RISE_FALL";
 GPIO2.associatedPins[1].pin.$assign      = "PA15";
 GPIO2.associatedPins[2].$name            = "KEY3";
 GPIO2.associatedPins[2].direction        = "INPUT";
@@ -146,12 +148,15 @@ UART1.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
 UART1.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
 UART1.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric7";
 
-UART2.$name                    = "UART_0";
-UART2.targetBaudRate           = 115200;
-UART2.direction                = "RX";
-UART2.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric3";
-UART2.peripheral.$assign       = "UART1";
-UART2.peripheral.rxPin.$assign = "PA9";
+UART2.$name                            = "UART_0";
+UART2.targetBaudRate                   = 115200;
+UART2.direction                        = "RX";
+UART2.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
+UART2.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
+UART2.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+UART2.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric3";
+UART2.peripheral.$assign               = "UART1";
+UART2.peripheral.rxPin.$assign         = "PA9";
 
 /**
  * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
