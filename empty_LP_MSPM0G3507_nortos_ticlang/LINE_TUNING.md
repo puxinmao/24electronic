@@ -8,7 +8,7 @@
 - 边缘传感器强制转向
 - 弯道自动减速
 - 传感器全灭后切换为两轮同速直行
-- 终点确认后继续直行约 1 秒，再自动停止
+- 终点确认后继续直行约 0.5 秒，再自动停止
 
 后续应优先通过参数调节改善效果，每次只调整一到两个参数并进行实车测试。
 
@@ -40,7 +40,7 @@
 | `LINE_ENTRY_FRAMES` | `300` | 入场慢速持续的主循环次数 | `200～600` |
 | `LINE_END_CONFIRM_MS` | `50` | 连续全灭多少毫秒后确认终点；调大不易误判，调小确认更快 | `20～200 ms` |
 | `LINE_FINISH_PWM` | `700` | 确认终点后的偏航直行 PWM，数值越大实际越慢 | `650～1100` |
-| `LINE_FINISH_RUN_MS` | `1000` | 终点后直行时间，单位毫秒；不再依赖陀螺仪帧率 | `500～2000 ms` |
+| `LINE_FINISH_RUN_MS` | `500` | 终点后直行时间，单位毫秒；不再依赖陀螺仪帧率 | `500～2000 ms` |
 
 ## 4. PID 参数
 
@@ -58,7 +58,7 @@ Line_Config(1200.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 
 ## 4.1 `empty.c` 主程序参数详解
 
-以下参数位于主程序 `empty.c` 的 `#define` 区域。它们主要改变速度、停止条件、KEY4 转向和故障保护，不改变控制框架。
+以下参数位于主程序 `empty.c` 的 `#define` 区域。它们主要改变速度、停止条件和故障保护，不改变控制框架。KEY4 当前未使用。
 
 ### 循迹流程参数
 
@@ -70,32 +70,34 @@ Line_Config(1200.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 | `LINE_ENTRY_FRAMES` | `300` | 入场慢速保持更久 | 更快恢复正常循迹速度 |
 | `LINE_END_CONFIRM_MS` | `50` | 需要更长时间全灭才确认终点，不容易误判 | 更快确认终点，但急弯短暂全灭时可能提前进入终点流程 |
 | `LINE_FINISH_PWM` | `700` | 终点后的实际直行速度更慢 | 终点后的实际直行速度更快 |
-| `LINE_FINISH_RUN_MS` | `1000` | 终点后继续直行更久 | 终点后更早停车 |
+| `LINE_FINISH_RUN_MS` | `500` | 终点后继续直行更久 | 终点后更早停车 |
 | `LINE_DETECT_MIN` | `1` | 需要更多路黑线才从直行切换循迹 | 更早进入循迹；`1` 已经是最敏感 |
 | `KEY1_STOP_BLACK_MIN` | `2` | KEY1 需要更多路同时检测到黑线才停 | 更容易因少量黑线提前停止 |
 
 全灭后当前逻辑会立即取消最后一次转向量，改为两轮同速向前。连续全灭达到 `LINE_END_CONFIRM_MS` 后，锁定当前偏航角并进入终点直行状态；经过 `LINE_FINISH_RUN_MS` 毫秒后停车。计时来自 1 ms 系统时基，不受陀螺仪数据频率影响。
 
-### KEY4 原地转向参数
+### 备用原地转向接口
+
+KEY4/PB19 的按键扫描已经取消，按下 KEY4 不会启动电机。原地右转算法已提取到 `control_straight.c` 的 `TurnInPlace_*` 接口，仅供后续自动流程显式调用。
 
 | 参数 | 当前值 | 调大后的效果 | 调小后的效果 |
 | --- | ---: | --- | --- |
-| `TURN_ANGLE_DEG` | `35.0f` | KEY4 原地右转角度变大 | 原地右转角度变小 |
-| `TURN_PWM_FAST` | `900` | 按当前反向 PWM 规则，原地转得更慢 | 原地转得更快 |
-| `TURN_PWM_SLOW` | `1200` | 接近目标时转得更慢、更不容易过冲 | 接近目标时转得更快，但可能超过目标角度 |
-| `TURN_SLOW_ANGLE` | `10` | 更早进入慢转阶段 | 更晚减速，转向更快但过冲风险更大 |
-| `TURN_BRAKE_FRAMES` | `10` | 转到目标后等待更久，车体更稳 | 更快进入后续直行流程 |
-| `TURN_TIMEOUT_FRAMES` | `300` | 允许转向更久，故障保护变慢 | 更快强制停车，防止电机一直转 |
+| `angle_deg` | `28.0f` | 备用右转目标角度变大 | 备用右转目标角度变小 |
+| `fast_pwm` | `900` | 按当前反向 PWM 规则，原地转得更慢 | 原地转得更快 |
+| `slow_pwm` | `1200` | 接近目标时转得更慢、更不容易过冲 | 接近目标时转得更快，但可能超过目标角度 |
+| `slow_angle_deg` | `10.0f` | 更早进入慢转阶段 | 更晚减速，转向更快但过冲风险更大 |
+| `brake_frames` | `10` | 转到目标后刹车等待更久 | 更快报告转向完成 |
+| `timeout_frames` | `300` | 允许转向更久，故障保护变慢 | 更快强制停车，防止电机一直转 |
 
 ### 故障保护参数
 
 | 参数 | 当前值 | 调大后的效果 | 调小后的效果 |
 | --- | ---: | --- | --- |
-| `TURN_STALL_FRAMES` | `40` | 对短时姿态波动更宽容，但冻结后停车更慢 | 更快发现偏航角不变，但可能误判 |
-| `TURN_STALL_MIN_DEG` | `0.5f` | 更容易判定转向不足并停车 | 更不容易误判冻结，但卡机保护变弱 |
+| `stall_frames` | `40` | 对短时姿态波动更宽容，但冻结后停车更慢 | 更快发现偏航角不变，但可能误判 |
+| `stall_min_deg` | `0.5f` | 更容易判定转向不足并停车 | 更不容易误判冻结，但卡机保护变弱 |
 | `WIT_LOSS_LOOP_LIMIT` | `2000` | 对陀螺仪短时丢帧更宽容，但真正断数据后停车更慢 | 更快检测陀螺仪掉线并停车，但误停概率增加 |
 
-> `TURN_TIMEOUT_FRAMES`、`TURN_STALL_FRAMES` 和 `WIT_LOSS_LOOP_LIMIT` 是保护参数，不建议为了提升性能而随意调大。
+> `timeout_frames`、`stall_frames`、`stall_min_deg` 和 `WIT_LOSS_LOOP_LIMIT` 是保护参数，不建议为了提升性能而随意调大或削弱。
 
 ## 4.2 通过参数改变小车性能
 
@@ -167,15 +169,9 @@ Line_Config(900.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 - 转向反应慢、但车辆很稳定：可以继续保持 `1200`，不必再增大。
 - 如果提高 `Kp` 后变化不明显，优先调整 `LINE_CORR_LIMIT`、`LINE_EDGE_MIN_CORR` 或降低 `LINE_SPEED_NORMAL`。
 
-### 想让 KEY4 转得更多
+### 后续自动流程需要原地右转
 
-只修改：
-
-```c
-#define TURN_ANGLE_DEG 38.0f
-```
-
-不要通过提高 `TURN_PWM_FAST` 来增加转角。由于当前 PWM 是反向的，提高 PWM 反而会降低电机转速。
+调用 `TurnInPlace_Config()` 设置目标角度，再用 `TurnInPlace_Start()` 启动，并在每个新姿态帧调用 `TurnInPlace_Update()`。当前主程序没有调用这些接口，因此不会影响 KEY1、KEY2、KEY3。PWM 数值越大实际转速越慢。
 
 ## 5. 不同现象的调节方法
 
@@ -290,7 +286,7 @@ Line_Config(1000.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 #define LINE_ENTRY_FRAMES       400
 #define LINE_END_CONFIRM_MS      50U
 #define LINE_FINISH_PWM          700
-#define LINE_FINISH_RUN_MS     1000U
+#define LINE_FINISH_RUN_MS      500U
 
 Line_Config(1200.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 ```

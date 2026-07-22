@@ -6,14 +6,22 @@
 #include "motor.h"
 #include "ti_msp_dl_config.h"
 
-#define LINE_CENTER 3.5f
-#define LINE_CORR_LIMIT       750.0f
-#define LINE_EDGE_ERROR         2.5f
-#define LINE_EDGE_MIN_CORR     620.0f
-#define LINE_CURVE_PWM_OFFSET  280
-#define LINE_LOST_PWM_BASE     950
-#define LINE_PWM_MIN            80
-#define LINE_PWM_MAX          1800
+/* ========== 巡线控制现场调参区 ========== */
+#define LINE_CENTER              3.5f /* 8 路传感器的位置中心 0..7；安装无偏差时不要调整 */
+#define LINE_PID_DT            0.005f /* PID 名义计算间隔；巡线由主循环调用，不跟随 JY901S 的 200 Hz */
+#define LINE_INTEGRAL_LIMIT     400.0f /* 积分累计限幅；当前 Ki=0，因此暂时不起作用 */
+#define LINE_LOST_PWM_BASE       950   /* Line_Update(0) 的寻线速度；当前主流程未使用该分支 */
+
+#define LINE_EDGE_ERROR           2.5f /* 误差达到此值视为压到边缘，强制使用较强转向 */
+
+//=========更主要的===============
+#define LINE_CORR_LIMIT         750.0f /* 最大左右差速修正；大误差时 PID 输出会被限制在此处 */
+#define LINE_EDGE_MIN_CORR       620.0f /* 边缘状态的最小转向修正；增大可加强急弯纠偏 */
+#define LINE_CURVE_PWM_PER_ERROR  80.0f /* 每 1.0 位置误差增加的减速 PWM；越大弯中越慢 */
+#define LINE_CURVE_PWM_OFFSET    280   /* 弯道减速 PWM 的最大增量；越大急弯整体越慢 */
+
+#define LINE_PWM_MIN              80   /* PWM 下限；PWM 反向，越小代表允许外侧轮驱动力越强 */
+#define LINE_PWM_MAX            1800   /* PWM 上限；PWM 反向，越大代表允许内侧轮驱动力越弱 */
 
 static PID_t  sPid;
 static int16_t sBaseSpeed = 500;
@@ -33,7 +41,8 @@ static int16_t line_clamp_pwm(int16_t pwm)
 void Line_Config(float kp, float ki, float kd, int16_t base_speed)
 {
     PID_Init(&sPid, kp, ki, kd,
-             -LINE_CORR_LIMIT, LINE_CORR_LIMIT, 400);
+             -LINE_CORR_LIMIT, LINE_CORR_LIMIT,
+             LINE_INTEGRAL_LIMIT);
     sBaseSpeed = base_speed;
 }
 
@@ -71,7 +80,7 @@ void Line_Update(uint8_t gray_map)
 
         sError = pos - LINE_CENTER;
         sLastValidError = sError;
-        sCorr = PID_Compute(&sPid, pos, 0.005f);
+        sCorr = PID_Compute(&sPid, pos, LINE_PID_DT);
 
         abs_error = (sError < 0.0f) ? -sError : sError;
         if (sError >= LINE_EDGE_ERROR && sCorr > -LINE_EDGE_MIN_CORR) {
@@ -82,7 +91,7 @@ void Line_Update(uint8_t gray_map)
         }
 
         /* This PWM is inverted: a larger compare value means less drive. */
-        curve_offset = (int16_t)(abs_error * 80.0f);
+        curve_offset = (int16_t)(abs_error * LINE_CURVE_PWM_PER_ERROR);
         if (curve_offset > LINE_CURVE_PWM_OFFSET) {
             curve_offset = LINE_CURVE_PWM_OFFSET;
         }
