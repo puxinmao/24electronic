@@ -6,7 +6,7 @@
  * KEY1 → 偏航直行 + 黑停
  * KEY2 → 停止
  * KEY3 → 直行 → 遇黑 → 循迹
- * KEY4 → 原地转向 38° → 直行 → 遇黑 → 循迹
+ * KEY4 → 原地转向 35° → 直行 → 遇黑 → 循迹
  */
 #include "ti_msp_dl_config.h"
 
@@ -33,6 +33,8 @@ static float    g_turn_last_yaw = 0.0f;
 static float    g_turn_progress = 0.0f;
 static uint8_t  g_turn_brake_frames = 0;
 static uint16_t g_turn_frames = 0;
+static uint8_t  g_turn_watch_frames = 0;
+static float    g_turn_watch_progress = 0.0f;
 static bool     g_turn_braking = false;
 static bool     g_key4_armed = true;
 static bool     g_wit_ready = false;
@@ -40,19 +42,22 @@ static uint16_t g_wit_silent_loops = 0;
 static uint16_t g_line_lost_frames = 0;
 static float    g_latest_yaw = 0.0f;
 
-#define LINE_SPEED_NORMAL  700   /* 正常循迹速度 */
-#define LINE_SPEED_ENTRY   1000  /* 入场减速速度（反向PWM，值大=慢） */
-#define LINE_ENTRY_FRAMES  300   /* 减速持续帧数（约80ms） */
-#define LINE_DETECT_MIN      1   /* 任意一路检测到黑线即进入循迹 */
-#define KEY1_STOP_BLACK_MIN  2   /* KEY1 至少两路检测到黑线时停止 */
+#define LINE_SPEED_NORMAL       700  /* 正常循迹基础 PWM；数值越大，实际速度越慢 */
+#define LINE_SPEED_ENTRY       1000  /* 刚进入循迹的基础 PWM；数值越大，入场越慢 */
+#define LINE_ENTRY_FRAMES       300  /* 入场慢速持续的主循环次数；越大，慢速保持越久 */
+#define LINE_LOST_STOP_FRAMES   200  /* 全灭后确认次数；首帧已刹车，越小越快进入停止 */
+#define LINE_DETECT_MIN           1  /* 直行转循迹的门槛：检测到几路黑线就切换 */
+#define KEY1_STOP_BLACK_MIN       2  /* KEY1 直行停止门槛：同时检测到几路黑线就停止 */
 
-#define TURN_ANGLE_DEG       38.0f
-#define TURN_PWM_FAST         900
-#define TURN_PWM_SLOW        1200
-#define TURN_SLOW_ANGLE      10.0f
-#define TURN_BRAKE_FRAMES       10  /* 刹车后等待约 100ms 再开始直行 */
-#define TURN_TIMEOUT_FRAMES    300  /* 约 3 秒（JY901S 姿态角 100Hz） */
-#define WIT_LOSS_LOOP_LIMIT   2000  /* No valid attitude frame for roughly 0.3 s. */
+#define TURN_ANGLE_DEG         35.0f /* KEY4 原地右转目标角度；调大转得更多 */
+#define TURN_PWM_FAST            900 /* KEY4 远离目标角度时的转向 PWM；数值越小转得越快 */
+#define TURN_PWM_SLOW           1200 /* KEY4 接近目标角度时的转向 PWM；数值越小收尾越快 */
+#define TURN_SLOW_ANGLE           10  /* 距目标多少度开始慢转；调大则更早减速 */
+#define TURN_BRAKE_FRAMES         10 /* 转到目标后刹车等待次数；越大停稳后等待越久 */
+#define TURN_TIMEOUT_FRAMES      300 /* KEY4 最多转向帧数；超时强制停车，防止一直转 */
+#define TURN_STALL_FRAMES          40 /* 连续多少个姿态帧检查一次陀螺仪转向进度 */
+#define TURN_STALL_MIN_DEG        0.5f /* 检查窗口内最小转角；过小判定偏航角冻结并停车 */
+#define WIT_LOSS_LOOP_LIMIT      2000 /* 连续无新陀螺仪数据的主循环次数；超限停车 */
 
 #define OLED_CLR(l) OLED_ShowString(3, l, (uint8_t *)"            ", 8)
 
@@ -91,6 +96,8 @@ static void stop_vehicle(void)
     g_track_entry = 0;
     g_line_lost_frames = 0;
     g_turn_braking = false;
+    g_turn_watch_frames = 0;
+    g_turn_watch_progress = 0.0f;
     g_wit_silent_loops = 0;
 }
 
@@ -122,7 +129,7 @@ int main(void)
     Gray_Init();
 
     Straight_Config(50.0f, 0.2f, 8.0f,  700);
-    Line_Config(240.0f, 0.0f, 30.0f, 700);
+    Line_Config(1200.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 
     OLED_Init(); OLED_Clear();
     OLED_ShowString(3, 0, (uint8_t *)"T3 Car Ready", 8);
@@ -233,9 +240,22 @@ int main(void)
                 /* 实车右转时 yaw 递减；逐帧累计，跨过 +/-180° 也能正确计角。 */
                 float step = yaw_error_norm(g_turn_last_yaw, wit.yaw);
                 g_turn_last_yaw = wit.yaw;
-                if (step > 0.0f && step < 20.0f) g_turn_progress += step;
+                if (step > -20.0f && step < 20.0f) g_turn_progress += step;
 
-                if (g_turn_progress >= TURN_ANGLE_DEG) {
+                bool turn_stalled = false;
+                if (++g_turn_watch_frames >= TURN_STALL_FRAMES) {
+                    float window_progress =
+                        g_turn_progress - g_turn_watch_progress;
+                    g_turn_watch_frames = 0;
+                    g_turn_watch_progress = g_turn_progress;
+                    turn_stalled = window_progress < TURN_STALL_MIN_DEG;
+                }
+
+                if (turn_stalled) {
+                    stop_vehicle();
+                    OLED_ShowString(3, 7, (uint8_t *)"TURN STALL ", 8);
+                    DBG_SendStr("STOP TURN YAW FROZEN\r\n");
+                } else if (g_turn_progress >= TURN_ANGLE_DEG) {
                     Motor_Brake();
                     g_turn_braking = true;
                     g_turn_brake_frames = 0;
@@ -290,11 +310,10 @@ int main(void)
                 }
             }
 
-            Line_Update(gray_map);
-
-            /* 丢线检测：连续 50 帧无线（灯全灭）自动停止 */
-            if (gray_map == 0) {
-                if (++g_line_lost_frames >= 50) {
+            /* 全灭期间禁止按最后方向找线，避免终点处转大圈。 */
+            if (gray_map == 0U) {
+                Motor_Brake();
+                if (++g_line_lost_frames >= LINE_LOST_STOP_FRAMES) {
                     Line_Stop();
                     g_state = S_IDLE;
                     g_line_lost_frames = 0;
@@ -304,6 +323,7 @@ int main(void)
                 }
             } else {
                 g_line_lost_frames = 0;
+                Line_Update(gray_map);
             }
 
             /* 降低 OLED/UART 刷新频率，避免阻塞导致循环计时抖动 */
@@ -375,6 +395,8 @@ int main(void)
                 g_turn_progress = 0.0f;
                 g_turn_brake_frames = 0;
                 g_turn_frames = 0;
+                g_turn_watch_frames = 0;
+                g_turn_watch_progress = 0.0f;
                 g_turn_braking = false;
                 g_wit_silent_loops = 0;
                 Motor_Enable();

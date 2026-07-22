@@ -7,10 +7,10 @@
 #include "oledfont.h"
 #include "ti_msp_dl_config.h"
 
-#define I2C_TIMEOUT_MS  10
+#define I2C_WAIT_LOOP_LIMIT  (CPUCLK_FREQ / 500U)
 
 /* ---------- 简单延时（使用 SysTick 风格） ---------- */
-static volatile uint32_t g_tick_ms = 0;
+static bool g_oled_available = true;
 
 static void oled_delay_ms(uint32_t ms)
 {
@@ -19,9 +19,37 @@ static void oled_delay_ms(uint32_t ms)
     }
 }
 
-static uint32_t oled_get_ms(void)
+static bool oled_wait_status(uint32_t mask, bool asserted)
 {
-    return g_tick_ms;
+    uint32_t limit = I2C_WAIT_LOOP_LIMIT;
+
+    while (limit-- > 0U) {
+        bool set = (DL_I2C_getControllerStatus(I2C_INST) & mask) != 0U;
+        if (set == asserted) return true;
+    }
+
+    return false;
+}
+
+static bool oled_wait_tx_done(void)
+{
+    uint32_t limit = I2C_WAIT_LOOP_LIMIT;
+
+    while (limit-- > 0U) {
+        if (DL_I2C_getRawInterruptStatus(I2C_INST,
+                DL_I2C_INTERRUPT_CONTROLLER_TX_DONE) != 0U) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void oled_disable(void)
+{
+    DL_I2C_resetControllerTransfer(I2C_INST);
+    DL_I2C_reset(I2C_INST);
+    g_oled_available = false;
 }
 
 /* ---------- I2C 总线恢复（SDA 被拉低时用） ---------- */
@@ -75,26 +103,24 @@ static void oled_i2c_sda_unlock(void)
 void OLED_WR_Byte(uint8_t dat, uint8_t mode)
 {
     uint8_t buf[2];
-    uint32_t start, cur;
+
+    if (!g_oled_available) return;
 
     buf[0] = (mode == OLED_CMD) ? 0x00 : 0x40;
     buf[1] = dat;
 
-    start = oled_get_ms();
+    if (!oled_wait_status(DL_I2C_CONTROLLER_STATUS_IDLE, true)) {
+        oled_disable();
+        return;
+    }
 
     DL_I2C_fillControllerTXFIFO(I2C_INST, buf, 2);
     DL_I2C_clearInterruptStatus(I2C_INST, DL_I2C_INTERRUPT_CONTROLLER_TX_DONE);
-    while (!(DL_I2C_getControllerStatus(I2C_INST) & DL_I2C_CONTROLLER_STATUS_IDLE));
     DL_I2C_startControllerTransfer(I2C_INST, 0x3C,
         DL_I2C_CONTROLLER_DIRECTION_TX, 2);
 
-    while (!DL_I2C_getRawInterruptStatus(I2C_INST,
-               DL_I2C_INTERRUPT_CONTROLLER_TX_DONE)) {
-        cur = oled_get_ms();
-        if (cur >= (start + I2C_TIMEOUT_MS)) {
-            oled_i2c_sda_unlock();
-            break;
-        }
+    if (!oled_wait_tx_done()) {
+        oled_disable();
     }
 }
 
@@ -229,6 +255,7 @@ void OLED_DrawBMP(uint8_t x, uint8_t y, uint8_t sizex, uint8_t sizey, uint8_t BM
 
 void OLED_Init(void)
 {
+    g_oled_available = true;
     DL_I2C_enableController(I2C_INST);
 
     if (DL_I2C_getSDAStatus(I2C_INST) == DL_I2C_CONTROLLER_SDA_LOW)

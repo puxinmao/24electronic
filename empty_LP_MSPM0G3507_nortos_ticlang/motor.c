@@ -7,6 +7,7 @@
  *  STBY:   PB9
  */
 #include "motor.h"
+#include "button.h"
 #include "ti_msp_dl_config.h"
 
 /* ========== 内部辅助 ========== */
@@ -127,5 +128,13 @@ void Motor_Standby(void)
 
 void Motor_Enable(void)
 {
-    DL_GPIO_setPins(GPIO_MOTOR_STBY_PORT, GPIO_MOTOR_STBY_PIN);
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+
+    if (!Button_EStopIsPending() &&
+        DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) != 0U) {
+        DL_GPIO_setPins(GPIO_MOTOR_STBY_PORT, GPIO_MOTOR_STBY_PIN);
+    }
+
+    if (primask == 0U) __enable_irq();
 }
