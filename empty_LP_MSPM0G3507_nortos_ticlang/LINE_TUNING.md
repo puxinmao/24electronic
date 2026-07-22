@@ -7,8 +7,8 @@
 - PID 差速转向
 - 边缘传感器强制转向
 - 弯道自动减速
-- 传感器全灭时立即刹车
-- 连续多次全灭确认后自动停止
+- 传感器全灭后切换为两轮同速直行
+- 终点确认后继续直行约 1 秒，再自动停止
 
 后续应优先通过参数调节改善效果，每次只调整一到两个参数并进行实车测试。
 
@@ -24,7 +24,7 @@
 | `LINE_EDGE_ERROR` | `2.5f` | 进入强制急转的偏差阈值，越小越早急转 | `1.8～2.8` |
 | `LINE_EDGE_MIN_CORR` | `620.0f` | 边缘传感器触发后的最小转向量 | `500～850` |
 | `LINE_CURVE_PWM_OFFSET` | `280` | 弯道整体减速程度，越大弯道越慢 | `150～450` |
-| `LINE_LOST_PWM_BASE` | `950` | 丢线找线时的基础速度，越大找线越慢 | `850～1200` |
+| `LINE_LOST_PWM_BASE` | `950` | 预留的丢线找线基础速度；当前主程序全灭时不调用 `Line_Update(0)`，因此暂不生效 | 暂不需要调整 |
 | `LINE_PWM_MIN` | `80` | 强侧车轮的 PWM 下限，越小外侧轮越强 | `50～300` |
 | `LINE_PWM_MAX` | `1800` | 弱侧车轮的 PWM 上限，越大内侧轮越弱 | `1500～1950` |
 
@@ -34,17 +34,20 @@
 
 | 参数 | 当前值 | 作用 | 建议范围 |
 | --- | ---: | --- | ---: |
+| `STRAIGHT_SPEED_NORMAL` | `700` | KEY1/KEY3 遇线前的偏航直行 PWM，数值越大实际越慢 | `650～1100` |
 | `LINE_SPEED_NORMAL` | `700` | 正常循迹速度，数值越大实际越慢 | `650～950` |
 | `LINE_SPEED_ENTRY` | `1000` | 刚进入循迹时的速度，数值越大实际越慢 | `850～1200` |
 | `LINE_ENTRY_FRAMES` | `300` | 入场慢速持续的主循环次数 | `200～600` |
-| `LINE_LOST_STOP_FRAMES` | `200` | 全灭确认次数；全灭首帧已经刹车；当前值偏大 | `3～20`，建议改小 |
+| `LINE_END_CONFIRM_MS` | `50` | 连续全灭多少毫秒后确认终点；调大不易误判，调小确认更快 | `20～200 ms` |
+| `LINE_FINISH_PWM` | `700` | 确认终点后的偏航直行 PWM，数值越大实际越慢 | `650～1100` |
+| `LINE_FINISH_RUN_MS` | `1000` | 终点后直行时间，单位毫秒；不再依赖陀螺仪帧率 | `500～2000 ms` |
 
 ## 4. PID 参数
 
 PID 配置位于 `empty.c`：
 
 ```c
-Line_Config(260.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
+Line_Config(1200.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 ```
 
 | 参数 | 当前值 | 作用 | 建议范围 |
@@ -61,14 +64,17 @@ Line_Config(260.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 
 | 参数 | 当前值 | 调大后的效果 | 调小后的效果 |
 | --- | ---: | --- | --- |
+| `STRAIGHT_SPEED_NORMAL` | `700` | KEY1/KEY3 遇线前的实际直线速度变慢 | KEY1/KEY3 遇线前的实际直线速度变快 |
 | `LINE_SPEED_NORMAL` | `700` | 正常循迹实际变慢，弯道更容易通过 | 实际速度变快，但更容易冲出弯道 |
 | `LINE_SPEED_ENTRY` | `1000` | 刚进入循迹时更慢、更稳 | 更快进入正常速度，容易冲过第一个弯 |
 | `LINE_ENTRY_FRAMES` | `300` | 入场慢速保持更久 | 更快恢复正常循迹速度 |
-| `LINE_LOST_STOP_FRAMES` | `200` | 允许更多次全灭后才进入 `IDLE`，但停止确认很慢 | 更快停止，传感器偶发全灭时也更容易误停 |
+| `LINE_END_CONFIRM_MS` | `50` | 需要更长时间全灭才确认终点，不容易误判 | 更快确认终点，但急弯短暂全灭时可能提前进入终点流程 |
+| `LINE_FINISH_PWM` | `700` | 终点后的实际直行速度更慢 | 终点后的实际直行速度更快 |
+| `LINE_FINISH_RUN_MS` | `1000` | 终点后继续直行更久 | 终点后更早停车 |
 | `LINE_DETECT_MIN` | `1` | 需要更多路黑线才从直行切换循迹 | 更早进入循迹；`1` 已经是最敏感 |
 | `KEY1_STOP_BLACK_MIN` | `2` | KEY1 需要更多路同时检测到黑线才停 | 更容易因少量黑线提前停止 |
 
-全灭时当前逻辑会在第一帧先刹车，因此 `LINE_LOST_STOP_FRAMES` 不会让小车继续按最后方向转圈；它只决定刹车后多久正式进入停止状态。
+全灭后当前逻辑会立即取消最后一次转向量，改为两轮同速向前。连续全灭达到 `LINE_END_CONFIRM_MS` 后，锁定当前偏航角并进入终点直行状态；经过 `LINE_FINISH_RUN_MS` 毫秒后停车。计时来自 1 ms 系统时基，不受陀螺仪数据频率影响。
 
 ### KEY4 原地转向参数
 
@@ -141,16 +147,16 @@ Line_Config(1200.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 
 如果当前实车直线不明显左右摆动，`Kp=1200` 可以继续使用，不需要为了降低数值而修改。当前代码还会把转向修正限制在 `±750`，因此 `Kp` 主要影响小偏差时的响应速度，大偏差时输出会受到限幅。
 
-只有在出现明显摆动、过弯来回修正或传感器跳变导致方向突变时，才建议降低 `Kp`，例如：
+只有在出现明显摆动、过弯来回修正或传感器跳变导致方向突变时，才建议逐步降低 `Kp`，例如先从 `1200` 降到：
 
 ```c
-Line_Config(260.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
+Line_Config(1000.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 ```
 
 如果降低后仍摆动，可试：
 
 ```c
-Line_Config(220.0f, 0.0f, 6.0f, LINE_SPEED_NORMAL);
+Line_Config(900.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 ```
 
 ### `Kp` 的实际调节原则
@@ -214,25 +220,25 @@ Line_Config(220.0f, 0.0f, 6.0f, LINE_SPEED_NORMAL);
 #define LINE_ENTRY_FRAMES       450
 ```
 
-### 5.5 急弯时偶发全灭导致停车
+### 5.5 急弯时偶发全灭被误判为终点
 
-适当增加全灭确认次数：
+当前值为 `50 ms`。如果急弯短暂全灭仍会被误判，可小步增加，例如：
 
 ```c
-#define LINE_LOST_STOP_FRAMES 12
+#define LINE_END_CONFIRM_MS 80U
 ```
 
-全灭首帧仍会立即刹车，不会按最后方向转圈；重新检测到黑线后会恢复循迹。
+全灭后会立即取消最后转向量并改为两轮同速前进；重新检测到黑线后恢复循迹。只有连续全灭达到该门限，才进入终点后 1 秒偏航直行。
 
 ### 5.6 直线左右摆动明显
 
-优先降低 `Kp`：
+当前 `Kp=1200` 如果实车稳定，应继续保持。只有出现明显左右摆动时才逐步降低，例如先调到：
 
 ```c
-Line_Config(230.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
+Line_Config(1000.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 ```
 
-如果只是轻微、快速的小幅抖动，可保持 `Kp` 不变，把 `Kd` 从 `8` 提高到 `10～12`。
+仍然摆动时再试 `Kp=900`。如果只是轻微、快速的小幅抖动，也可保持 `Kp` 不变，把 `Kd` 从 `8` 小步提高到 `10～12`。
 
 不要同时大幅提高 `Kp` 和 `Kd`，否则传感器位置跳变时容易产生剧烈输出。
 
@@ -251,12 +257,12 @@ Line_Config(230.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 #define LINE_EDGE_ERROR       2.8f
 ```
 
-### 5.8 全灭后停止确认太慢
+### 5.8 全灭后终点确认太慢
 
-减少确认次数：
+当前值为 `50 ms`。可先减少到 `30 ms` 测试，不建议直接降得过小，否则急弯短暂全灭很容易被当成终点：
 
 ```c
-#define LINE_LOST_STOP_FRAMES 5
+#define LINE_END_CONFIRM_MS 30U
 ```
 
 ## 6. 推荐的强转向参数
@@ -270,10 +276,11 @@ Line_Config(230.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 #define LINE_EDGE_ERROR         2.0f
 #define LINE_EDGE_MIN_CORR     720.0f
 #define LINE_CURVE_PWM_OFFSET  350
-#define LINE_LOST_PWM_BASE    1000
 #define LINE_PWM_MIN            80
 #define LINE_PWM_MAX          1800
 ```
+
+`LINE_LOST_PWM_BASE` 在当前终点处理流程中不生效，不需要为了增强转向而修改。
 
 `empty.c`：
 
@@ -281,9 +288,11 @@ Line_Config(230.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 #define LINE_SPEED_NORMAL       800
 #define LINE_SPEED_ENTRY       1100
 #define LINE_ENTRY_FRAMES       400
-#define LINE_LOST_STOP_FRAMES     8
+#define LINE_END_CONFIRM_MS      50U
+#define LINE_FINISH_PWM          700
+#define LINE_FINISH_RUN_MS     1000U
 
-Line_Config(270.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
+Line_Config(1200.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 ```
 
 这套参数的特点是：
@@ -291,7 +300,7 @@ Line_Config(270.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 - 更早进入强转向
 - 提高左右轮最大差速
 - 弯道自动降低速度
-- 传感器全灭时立即刹车，不再按最后方向转圈
+- 传感器全灭时取消最后转向量，确认终点后偏航直行约 1 秒再停止
 
 ## 7. 推荐调试顺序
 
@@ -299,8 +308,8 @@ Line_Config(270.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 2. 转不过弯时，只提高 `LINE_CORR_LIMIT` 和 `LINE_EDGE_MIN_CORR`。
 3. 转向启动太晚时，再降低 `LINE_EDGE_ERROR`。
 4. 已经强转但仍冲出弯道时，提高 `LINE_CURVE_PWM_OFFSET` 或 `LINE_SPEED_NORMAL` 来减速。
-5. 直线摆动时，降低 `Kp`，然后再小幅调整 `Kd`。
-6. 最后调整全灭停止的确认次数。
+5. 直线摆动时，从当前 `Kp=1200` 开始逐级降低，然后再小幅调整 `Kd`。
+6. 最后调整全灭终点确认次数、终点后运行速度和运行时间。
 
 每次只修改一组相关参数，避免无法判断是哪一个参数改变了效果。
 
@@ -310,7 +319,7 @@ Line_Config(270.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 
 | 测试次数 | `Kp` | `Kd` | `CORR_LIMIT` | `EDGE_ERROR` | `EDGE_MIN_CORR` | 正常速度 | 现象 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 1 | 260 | 8 | 750 | 2.5 | 620 | 700 | 初始参数 |
+| 1 | 1200 | 8 | 750 | 2.5 | 620 | 700 | 当前参数 |
 | 2 |  |  |  |  |  |  |  |
 | 3 |  |  |  |  |  |  |  |
 

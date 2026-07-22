@@ -5,8 +5,8 @@
  *
  * KEY1 → 偏航直行 + 黑停
  * KEY2 → 停止
- * KEY3 → 直行 → 遇黑 → 循迹
- * KEY4 → 原地转向 35° → 直行 → 遇黑 → 循迹
+ * KEY3 → 直行 → 遇黑 → 循迹 → 终点直行约 1 秒 → 停止
+ * KEY4 → 原地转向 35° → 直行 → 遇黑 → 循迹 → 终点直行约 1 秒 → 停止
  */
 #include "ti_msp_dl_config.h"
 
@@ -23,7 +23,14 @@
 #include <stdio.h>
 
 /* ========== 状态 ========== */
-typedef enum { S_IDLE, S_YAW, S_TURN_IN_PLACE, S_LINE_STRAIGHT, S_LINE_TRACK } State_t;
+typedef enum {
+    S_IDLE,
+    S_YAW,
+    S_TURN_IN_PLACE,
+    S_LINE_STRAIGHT,
+    S_LINE_TRACK,
+    S_LINE_FINISH_RUN
+} State_t;
 static State_t  g_state = S_IDLE;
 static uint32_t g_cnt   = 0;
 static char     g_buf[32];
@@ -39,13 +46,19 @@ static bool     g_turn_braking = false;
 static bool     g_key4_armed = true;
 static bool     g_wit_ready = false;
 static uint16_t g_wit_silent_loops = 0;
-static uint16_t g_line_lost_frames = 0;
+static bool     g_line_lost_timing = false;
+static uint32_t g_line_lost_start_ms = 0;
+static uint32_t g_line_finish_start_ms = 0;
+static volatile uint32_t g_ms_ticks = 0;
 static float    g_latest_yaw = 0.0f;
 
+#define STRAIGHT_SPEED_NORMAL   700  /* KEY1/KEY3 直线基础 PWM；数值越大，实际速度越慢 */
 #define LINE_SPEED_NORMAL       700  /* 正常循迹基础 PWM；数值越大，实际速度越慢 */
 #define LINE_SPEED_ENTRY       1000  /* 刚进入循迹的基础 PWM；数值越大，入场越慢 */
 #define LINE_ENTRY_FRAMES       300  /* 入场慢速持续的主循环次数；越大，慢速保持越久 */
-#define LINE_LOST_STOP_FRAMES   200  /* 全灭后确认次数；首帧已刹车，越小越快进入停止 */
+#define LINE_END_CONFIRM_MS      50U /* 连续全灭确认时间；越大越不易误判终点，越小越快确认 */
+#define LINE_FINISH_PWM          700  /* 终点后偏航直行 PWM；数值越大，实际运行速度越慢 */
+#define LINE_FINISH_RUN_MS     500U /* 终点后直行毫秒数；1000 为 1 秒，越大运行越久 */
 #define LINE_DETECT_MIN           1  /* 直行转循迹的门槛：检测到几路黑线就切换 */
 #define KEY1_STOP_BLACK_MIN       2  /* KEY1 直行停止门槛：同时检测到几路黑线就停止 */
 
@@ -66,6 +79,16 @@ static void delay_ms(uint32_t ms) {
     while (ms--) delay_cycles(CPUCLK_FREQ / 1000);
 }
 
+static uint32_t elapsed_ms(uint32_t start_ms)
+{
+    return g_ms_ticks - start_ms;
+}
+
+void SysTick_Handler(void)
+{
+    g_ms_ticks++;
+}
+
 static float yaw_error_norm(float target, float current)
 {
     float error = target - current;
@@ -84,17 +107,20 @@ static float yaw_norm(float yaw)
 static bool state_uses_wit(State_t state)
 {
     return state == S_YAW || state == S_TURN_IN_PLACE ||
-           state == S_LINE_STRAIGHT;
+           state == S_LINE_STRAIGHT || state == S_LINE_FINISH_RUN;
 }
 
 static void stop_vehicle(void)
 {
     Straight_Stop();
+    Straight_Config(50.0f, 0.2f, 8.0f, STRAIGHT_SPEED_NORMAL);
     Line_Stop();
     Line_SetBaseSpeed(LINE_SPEED_NORMAL);
     g_state = S_IDLE;
     g_track_entry = 0;
-    g_line_lost_frames = 0;
+    g_line_lost_timing = false;
+    g_line_lost_start_ms = 0;
+    g_line_finish_start_ms = 0;
     g_turn_braking = false;
     g_turn_watch_frames = 0;
     g_turn_watch_progress = 0.0f;
@@ -119,6 +145,7 @@ static bool wit_can_start(void)
 int main(void)
 {
     SYSCFG_DL_init();
+    (void)DL_SYSTICK_config(CPUCLK_FREQ / 1000U);
     DBG_SendStr("System OK\r\n");
 
     Motor_Init(); 
@@ -128,7 +155,7 @@ int main(void)
     Button_EStopInit();
     Gray_Init();
 
-    Straight_Config(50.0f, 0.2f, 8.0f,  700);
+    Straight_Config(50.0f, 0.2f, 8.0f, STRAIGHT_SPEED_NORMAL);
     Line_Config(1200.0f, 0.0f, 8.0f, LINE_SPEED_NORMAL);
 
     OLED_Init(); OLED_Clear();
@@ -294,7 +321,7 @@ int main(void)
                 Line_Start();
                 g_state = S_LINE_TRACK;
                 g_track_entry = LINE_ENTRY_FRAMES;
-                g_line_lost_frames = 0;
+                g_line_lost_timing = false;
                 OLED_ShowString(3, 7, (uint8_t *)"LINE TRACK", 8);
                 DBG_Printf("-> LINE TRACK G:0x%02X\r\n", gray_map);
             }
@@ -310,19 +337,26 @@ int main(void)
                 }
             }
 
-            /* 全灭期间禁止按最后方向找线，避免终点处转大圈。 */
+            /* 全灭期间改为两轮同速向前，避免沿最后转向量画大圈。 */
             if (gray_map == 0U) {
-                Motor_Brake();
-                if (++g_line_lost_frames >= LINE_LOST_STOP_FRAMES) {
-                    Line_Stop();
-                    g_state = S_IDLE;
-                    g_line_lost_frames = 0;
+                Motor_SetBoth(LINE_FINISH_PWM, LINE_FINISH_PWM);
+                if (!g_line_lost_timing) {
+                    g_line_lost_timing = true;
+                    g_line_lost_start_ms = g_ms_ticks;
+                }
+                if (elapsed_ms(g_line_lost_start_ms) >= LINE_END_CONFIRM_MS) {
+                    g_line_lost_timing = false;
+                    Straight_Config(50.0f, 0.2f, 8.0f, LINE_FINISH_PWM);
+                    Straight_Start(g_latest_yaw);
+                    g_line_finish_start_ms = g_ms_ticks;
+                    g_state = S_LINE_FINISH_RUN;
                     OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
-                    OLED_ShowString(3, 7, (uint8_t *)"LOST LINE ", 8);
-                    DBG_SendStr("STOP LOST LINE\r\n");
+                    OLED_ShowString(3, 7, (uint8_t *)"FINISH RUN", 8);
+                    DBG_Printf("LINE END -> RUN %luMS\r\n",
+                               (unsigned long)LINE_FINISH_RUN_MS);
                 }
             } else {
-                g_line_lost_frames = 0;
+                g_line_lost_timing = false;
                 Line_Update(gray_map);
             }
 
@@ -336,6 +370,21 @@ int main(void)
                 OLED_ShowString(67, 6, (uint8_t *)g_buf, 8);
                 DBG_Printf("G:0x%02X E:%.1f C:%.0f\r\n",
                     gray_map, Line_GetError(), Line_GetCorrection());
+            }
+        }
+
+        /* ========== S_LINE_FINISH_RUN: 按毫秒计时，不依赖陀螺仪帧率 ========== */
+        if (g_state == S_LINE_FINISH_RUN) {
+            if (wit_new) (void)Straight_Update(wit.yaw);
+            if (elapsed_ms(g_line_finish_start_ms) >= LINE_FINISH_RUN_MS) {
+                Straight_Stop();
+                Straight_Config(50.0f, 0.2f, 8.0f,
+                                STRAIGHT_SPEED_NORMAL);
+                g_state = S_IDLE;
+                g_line_finish_start_ms = 0;
+                OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
+                OLED_ShowString(3, 7, (uint8_t *)"FINISH STOP", 8);
+                DBG_SendStr("STOP LINE FINISH\r\n");
             }
         }
 
