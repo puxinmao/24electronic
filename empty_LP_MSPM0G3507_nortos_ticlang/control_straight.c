@@ -4,6 +4,7 @@
 #include "control_straight.h"
 #include "pid.h"
 #include "motor.h"
+#include "speed_control.h"
 #include "ti_msp_dl_config.h"
 
 static PID_t  sPid;
@@ -77,7 +78,7 @@ void Straight_Start(float current_yaw, uint32_t now_ms)
     sTargetYaw = current_yaw;
     PID_Reset(&sPid);
     PID_SetSetpoint(&sPid, sTargetYaw);
-    Motor_Enable();
+    SpeedControl_Start(now_ms);
     sRunning = true;
     sFirstUpdate = true;
     sRampStarted = false;
@@ -121,7 +122,7 @@ float Straight_Update(float current_yaw, uint32_t now_ms)
     int16_t right = base - (int16_t)corr + right_trim;
     if (left  < 0) left  = 0;
     if (right < 0) right = 0;
-    Motor_SetBoth(left, right);
+    SpeedControl_SetCommand(left, right);
 
     return err;
 }
@@ -131,8 +132,7 @@ void Straight_Stop(void)
     sRunning = false;
     sFirstUpdate = false;
     sRampStarted = false;
-    Motor_Brake();
-    Motor_Standby();
+    SpeedControl_Stop();
 }
 
 float Straight_GetTarget(void) { return sTargetYaw; }

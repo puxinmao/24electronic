@@ -17,6 +17,9 @@ void Encoder_Init(void);
 int32_t Encoder_GetLeft(void);
 int32_t Encoder_GetRight(void);
 
+/* 原子读取左右轮累计位置，供双轮速度采样使用。 */
+void Encoder_GetCounts(int32_t *left, int32_t *right);
+
 /* 获取速度 (脉冲/s)，dt 为距离上次调用的秒数 */
 int16_t Encoder_GetLeftSpeed(float dt);
 int16_t Encoder_GetRightSpeed(float dt);

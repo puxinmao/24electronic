@@ -3,7 +3,7 @@
  */
 #include "control_line.h"
 #include "pid.h"
-#include "motor.h"
+#include "speed_control.h"
 #include "ti_msp_dl_config.h"
 
 /* ========== 巡线控制现场调参区 ========== */
@@ -58,7 +58,7 @@ void Line_Start(uint32_t now_ms)
     sLastValidError = 0.0f;
     sLastUpdateMs = now_ms;
     sFirstUpdate = true;
-    Motor_Enable();
+    SpeedControl_Start(now_ms);
 }
 
 void Line_Update(uint8_t gray_map, uint32_t now_ms)
@@ -114,13 +114,12 @@ void Line_Update(uint8_t gray_map, uint32_t now_ms)
 
     int16_t left  = line_clamp_pwm(drive_base + (int16_t)sCorr);
     int16_t right = line_clamp_pwm(drive_base - (int16_t)sCorr);
-    Motor_SetBoth(left, right);
+    SpeedControl_SetCommand(left, right);
 }
 
 void Line_Stop(void)
 {
-    Motor_Brake();
-    Motor_Standby();
+    SpeedControl_Stop();
 }
 
 void Line_SetBaseSpeed(int16_t speed)

@@ -14,6 +14,7 @@
 #include "control_line.h"
 #include "motor.h"
 #include "encoder.h"
+#include "speed_control.h"
 #include "uart_debug.h"
 #include "gray.h"
 #include "oled.h"
@@ -39,15 +40,16 @@ static uint32_t g_oled_last_ms = 0;
 static bool     g_line_entry_active = false;
 static uint32_t g_line_entry_start_ms = 0;
 static uint32_t g_line_control_last_ms = 0;
+static uint32_t g_speed_debug_last_ms = 0;
 static bool     g_line_lost_timing = false;
 static uint32_t g_line_lost_start_ms = 0;
 static uint32_t g_line_finish_start_ms = 0;
 static volatile uint32_t g_ms_ticks = 0;
 static float    g_latest_yaw = 0.0f;
 
-#define STRAIGHT_SPEED_NORMAL   700  /* 直线基础 PWM；数值越大，实际速度越慢 */
-#define LINE_SPEED_NORMAL       700  /* 正常循迹基础 PWM；数值越大，实际速度越慢 */
-#define LINE_SPEED_ENTRY       1000  /* 刚进入循迹的基础 PWM；数值越大，入场越慢 */
+#define STRAIGHT_SPEED_NORMAL   700  /* 直线速度指令；沿用反向 PWM 标度，数值越大越慢 */
+#define LINE_SPEED_NORMAL       700  /* 正常巡线速度指令；沿用反向 PWM 标度，数值越大越慢 */
+#define LINE_SPEED_ENTRY       1000  /* 入场速度指令；沿用反向 PWM 标度，数值越大越慢 */
 
 #define STRAIGHT_KP            50.0f /* 直线比例：纠偏弱时增大，持续蛇形时减小 */
 #define STRAIGHT_KI             0.2f /* 直线积分：处理长期小偏差；调试初期保持不动 */
@@ -64,6 +66,7 @@ static float    g_latest_yaw = 0.0f;
 
 #define WIT_LOSS_TIMEOUT_MS       500U /* 连续无新姿态数据的毫秒数；超限停车 */
 #define OLED_REFRESH_MS           100U /* 姿态显示刷新周期；降低阻塞对控制周期的影响 */
+#define SPEED_DEBUG_PERIOD_MS     200U /* 速度串口遥测周期；调试完成后可调大 */
 
 #define LINE_END_CONFIRM_MS      50U /* 连续全灭确认时间；越大越不易误判终点，越小越快确认 */
 #define LINE_FINISH_PWM          700  /* 终点后偏航直行 PWM；数值越大，实际运行速度越慢 */
@@ -134,6 +137,7 @@ int main(void)
     Motor_Standby();
     DL_TimerA_startCounter(PWM_INST);
     Encoder_Init();
+    SpeedControl_Init(g_ms_ticks);
     Button_EStopInit();
     Gray_Init();
 
@@ -170,7 +174,34 @@ int main(void)
         WIT_Data_t wit;
         bool wit_new = WIT_GetData(&wit);
         uint8_t gray_map = Gray_ReadAll();
+        bool speed_updated = SpeedControl_Update(g_ms_ticks);
         g_cnt++;
+
+        if (SpeedControl_GetFault() != SPEED_CONTROL_FAULT_NONE) {
+            SpeedControlFault_t fault = SpeedControl_GetFault();
+            stop_vehicle();
+            SpeedControl_ClearFault();
+            OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
+            OLED_ShowString(3, 7,
+                (uint8_t *)((fault == SPEED_CONTROL_FAULT_LEFT_STALL) ?
+                            "ENC LEFT  " : "ENC RIGHT "), 8);
+            DBG_SendStr((fault == SPEED_CONTROL_FAULT_LEFT_STALL) ?
+                        "STOP LEFT ENCODER STALL\r\n" :
+                        "STOP RIGHT ENCODER STALL\r\n");
+            continue;
+        }
+
+        if (speed_updated && SpeedControl_IsRunning() &&
+            elapsed_ms(g_speed_debug_last_ms) >= SPEED_DEBUG_PERIOD_MS) {
+            g_speed_debug_last_ms = g_ms_ticks;
+            DBG_Printf("SPD TL:%ld ML:%ld PL:%d TR:%ld MR:%ld PR:%d\r\n",
+                (long)SpeedControl_GetLeftTarget(),
+                (long)SpeedControl_GetLeftMeasured(),
+                SpeedControl_GetLeftOutput(),
+                (long)SpeedControl_GetRightTarget(),
+                (long)SpeedControl_GetRightMeasured(),
+                SpeedControl_GetRightOutput());
+        }
 
         if (wit_new) {
             g_latest_yaw = wit.yaw;
@@ -266,7 +297,7 @@ int main(void)
 
             /* 全灭期间改为两轮同速向前，避免沿最后转向量画大圈。 */
             if (gray_map == 0U) {
-                Motor_SetBoth(LINE_FINISH_PWM, LINE_FINISH_PWM);
+                SpeedControl_SetCommand(LINE_FINISH_PWM, LINE_FINISH_PWM);
                 if (!g_line_lost_timing) {
                     g_line_lost_timing = true;
                     g_line_lost_start_ms = g_ms_ticks;

@@ -77,6 +77,15 @@ void Encoder_Init(void)
 int32_t Encoder_GetLeft(void)  { return gEncLeft; }
 int32_t Encoder_GetRight(void) { return gEncRight; }
 
+void Encoder_GetCounts(int32_t *left, int32_t *right)
+{
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    *left = gEncLeft;
+    *right = gEncRight;
+    if (primask == 0U) __enable_irq();
+}
+
 int16_t Encoder_GetLeftSpeed(float dt)
 {
     int32_t delta = gEncLeft - gEncLeftPrev;
