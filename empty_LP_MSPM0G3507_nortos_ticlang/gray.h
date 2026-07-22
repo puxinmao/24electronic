@@ -15,7 +15,7 @@ void Gray_Init(void);
 /* 选择通道 0~7 */
 void Gray_SelectChannel(uint8_t ch);
 
-/* 读取当前通道的值 (0=黑/低, 1=白/高) */
+/* 读取当前通道的数字电平；当前整车逻辑按 1=检测到黑线、0=未检测到处理。 */
 uint8_t Gray_Read(void);
 
 /* 依次读取 8 个通道，返回 8-bit 位图 (bit0 = CH0) */

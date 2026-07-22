@@ -8,7 +8,8 @@
 
 /* ========== 巡线控制现场调参区 ========== */
 #define LINE_CENTER              3.5f /* 8 路传感器的位置中心 0..7；安装无偏差时不要调整 */
-#define LINE_PID_DT            0.005f /* PID 名义计算间隔；巡线由主循环调用，不跟随 JY901S 的 200 Hz */
+#define LINE_PID_DT_DEFAULT    0.005f /* 首次更新的默认 dt；后续使用 SysTick 实际间隔 */
+#define LINE_PID_DT_MAX        0.050f /* 主循环偶发阻塞后的 dt 上限，避免单次积分跨度过大 */
 #define LINE_INTEGRAL_LIMIT     400.0f /* 积分累计限幅；当前 Ki=0，因此暂时不起作用 */
 #define LINE_LOST_PWM_BASE       950   /* Line_Update(0) 的寻线速度；当前主流程未使用该分支 */
 
@@ -28,6 +29,8 @@ static int16_t sBaseSpeed = 500;
 static float  sError = 0.0f;
 static float  sCorr  = 0.0f;
 static float  sLastValidError = 0.0f;
+static uint32_t sLastUpdateMs = 0;
+static bool sFirstUpdate = false;
 
 static int16_t line_clamp_pwm(int16_t pwm)
 {
@@ -46,17 +49,19 @@ void Line_Config(float kp, float ki, float kd, int16_t base_speed)
     sBaseSpeed = base_speed;
 }
 
-void Line_Start(void)
+void Line_Start(uint32_t now_ms)
 {
     PID_Reset(&sPid);
     PID_SetSetpoint(&sPid, LINE_CENTER);
     sError = 0.0f;
     sCorr = 0.0f;
     sLastValidError = 0.0f;
+    sLastUpdateMs = now_ms;
+    sFirstUpdate = true;
     Motor_Enable();
 }
 
-void Line_Update(uint8_t gray_map)
+void Line_Update(uint8_t gray_map, uint32_t now_ms)
 {
     int16_t drive_base = sBaseSpeed;
 
@@ -76,11 +81,20 @@ void Line_Update(uint8_t gray_map)
     } else {
         float pos = Line_GetPosition(gray_map);
         float abs_error;
+        float dt = LINE_PID_DT_DEFAULT;
         int16_t curve_offset;
+
+        if (!sFirstUpdate) {
+            uint32_t elapsed_ms = now_ms - sLastUpdateMs;
+            if (elapsed_ms > 0U) dt = (float)elapsed_ms * 0.001f;
+            if (dt > LINE_PID_DT_MAX) dt = LINE_PID_DT_MAX;
+        }
+        sFirstUpdate = false;
+        sLastUpdateMs = now_ms;
 
         sError = pos - LINE_CENTER;
         sLastValidError = sError;
-        sCorr = PID_Compute(&sPid, pos, LINE_PID_DT);
+        sCorr = PID_Compute(&sPid, pos, dt);
 
         abs_error = (sError < 0.0f) ? -sError : sError;
         if (sError >= LINE_EDGE_ERROR && sCorr > -LINE_EDGE_MIN_CORR) {

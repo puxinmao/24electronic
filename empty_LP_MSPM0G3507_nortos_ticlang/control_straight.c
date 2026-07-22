@@ -11,6 +11,7 @@ static float  sTargetYaw = 0.0f;
 static int16_t sBaseSpeed = 700;
 static bool   sRunning = false;
 static bool   sFirstUpdate = false;
+static bool   sRampStarted = false;
 static uint32_t sStartMs = 0;
 static uint32_t sLastUpdateMs = 0;
 
@@ -40,7 +41,7 @@ static bool sTurnBraking = false;
 #define STRAIGHT_INTEGRAL_LIMIT   400.0f /* 积分累计限幅；通常不需要现场调整 */
 
 //==========启动时候的修正=========
-#define STRAIGHT_RAMP_MS            200U /* 启动渐变持续时间；由 SysTick 计时，不依赖陀螺仪帧率 */
+#define STRAIGHT_RAMP_MS            200U /* 首次控制更新起的渐变时间；由 SysTick 计时 */
 #define STRAIGHT_START_PWM_OFFSET   300  /* 启动时加到两轮 PWM；越大起步越慢，随后渐变为 0 */
 #define STRAIGHT_RIGHT_PWM_TRIM      0 /* 启动时额外减弱右轮；只修正起步偏差，不能修正常态跑偏 */
 
@@ -79,6 +80,7 @@ void Straight_Start(float current_yaw, uint32_t now_ms)
     Motor_Enable();
     sRunning = true;
     sFirstUpdate = true;
+    sRampStarted = false;
     sStartMs = now_ms;
     sLastUpdateMs = now_ms;
 }
@@ -89,6 +91,10 @@ float Straight_Update(float current_yaw, uint32_t now_ms)
 
     float err  = yaw_error_norm(current_yaw, sTargetYaw);   /* cur-tgt，用于返回显示 */
     float dt = STRAIGHT_PID_DT_DEFAULT;
+    if (!sRampStarted) {
+        sStartMs = now_ms;
+        sRampStarted = true;
+    }
     if (sFirstUpdate) {
         sPid.prev_error = -err;
         sFirstUpdate = false;
@@ -124,6 +130,7 @@ void Straight_Stop(void)
 {
     sRunning = false;
     sFirstUpdate = false;
+    sRampStarted = false;
     Motor_Brake();
     Motor_Standby();
 }

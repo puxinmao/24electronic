@@ -33,9 +33,12 @@ typedef enum {
 static State_t  g_state = S_IDLE;
 static uint32_t g_cnt   = 0;
 static char     g_buf[32];
-static uint16_t g_track_entry = 0;  /* 入场减速帧计数 */
 static bool     g_wit_ready = false;
-static uint16_t g_wit_silent_loops = 0;
+static uint32_t g_wit_last_ms = 0;
+static uint32_t g_oled_last_ms = 0;
+static bool     g_line_entry_active = false;
+static uint32_t g_line_entry_start_ms = 0;
+static uint32_t g_line_control_last_ms = 0;
 static bool     g_line_lost_timing = false;
 static uint32_t g_line_lost_start_ms = 0;
 static uint32_t g_line_finish_start_ms = 0;
@@ -54,11 +57,13 @@ static float    g_latest_yaw = 0.0f;
 #define LINE_KI                 0.0f /* 巡线积分：数字灰度巡线建议保持为 0 */
 #define LINE_KD                 8.0f /* 巡线微分：抑制慢摆，也会放大探头位置跳变 */
 
-#define LINE_ENTRY_FRAMES       300  /* 入场慢速持续的主循环次数；越大，慢速保持越久 */
+#define LINE_CONTROL_PERIOD_MS    5U /* 巡线控制目标周期；5 ms 对应 200 Hz */
+#define LINE_ENTRY_MS          1500U /* 入场慢速时间；按 300 个目标控制周期折算为 1500 ms */
 #define LINE_DETECT_MIN           1  /* 直行转循迹的门槛：检测到几路黑线就切换 */
 #define KEY1_STOP_BLACK_MIN       1  /* KEY1 直行停止门槛：同时检测到几路黑线就停止 */
 
-#define WIT_LOSS_LOOP_LIMIT      2000 /* 连续无新陀螺仪数据的主循环次数；超限停车 */
+#define WIT_LOSS_TIMEOUT_MS       500U /* 连续无新姿态数据的毫秒数；超限停车 */
+#define OLED_REFRESH_MS           100U /* 姿态显示刷新周期；降低阻塞对控制周期的影响 */
 
 #define LINE_END_CONFIRM_MS      50U /* 连续全灭确认时间；越大越不易误判终点，越小越快确认 */
 #define LINE_FINISH_PWM          700  /* 终点后偏航直行 PWM；数值越大，实际运行速度越慢 */
@@ -95,12 +100,13 @@ static void stop_vehicle(void)
     Line_Stop();
     Line_SetBaseSpeed(LINE_SPEED_NORMAL);
     g_state = S_IDLE;
-    g_track_entry = 0;
+    g_line_entry_active = false;
+    g_line_entry_start_ms = 0;
+    g_line_control_last_ms = 0;
     g_line_lost_timing = false;
     g_line_lost_start_ms = 0;
     g_line_finish_start_ms = 0;
     TurnInPlace_Stop();
-    g_wit_silent_loops = 0;
 }
 
 static bool wit_can_start(void)
@@ -169,19 +175,18 @@ int main(void)
         if (wit_new) {
             g_latest_yaw = wit.yaw;
             g_wit_ready = true;
-            g_wit_silent_loops = 0;
-        } else if (g_wit_ready &&
-                   g_wit_silent_loops < WIT_LOSS_LOOP_LIMIT) {
-            g_wit_silent_loops++;
+            g_wit_last_ms = g_ms_ticks;
         }
 
         if (g_state == S_IDLE &&
-            g_wit_silent_loops >= WIT_LOSS_LOOP_LIMIT) {
+            g_wit_ready &&
+            elapsed_ms(g_wit_last_ms) >= WIT_LOSS_TIMEOUT_MS) {
             g_wit_ready = false;
         }
 
         if (state_uses_wit(g_state) &&
-            g_wit_silent_loops >= WIT_LOSS_LOOP_LIMIT) {
+            g_wit_ready &&
+            elapsed_ms(g_wit_last_ms) >= WIT_LOSS_TIMEOUT_MS) {
             stop_vehicle();
             WIT_Recover();
             g_wit_ready = false;
@@ -192,7 +197,8 @@ int main(void)
         }
 
         /* ---- OLED 角度 ---- */
-        if (wit_new) {
+        if (wit_new && elapsed_ms(g_oled_last_ms) >= OLED_REFRESH_MS) {
+            g_oled_last_ms = g_ms_ticks;
             sprintf(g_buf, "P:%-5.1f", wit.pitch);
             OLED_ShowString(3, 0, (uint8_t *)g_buf, 8);
             sprintf(g_buf, "R:%-5.1f", wit.roll);
@@ -237,9 +243,11 @@ int main(void)
             if (Gray_BlackCount(gray_map) >= LINE_DETECT_MIN) {
                 Straight_Stop();
                 Line_SetBaseSpeed(LINE_SPEED_ENTRY); /* 先以慢速入场 */
-                Line_Start();
+                Line_Start(g_ms_ticks);
                 g_state = S_LINE_TRACK;
-                g_track_entry = LINE_ENTRY_FRAMES;
+                g_line_entry_active = true;
+                g_line_entry_start_ms = g_ms_ticks;
+                g_line_control_last_ms = g_ms_ticks - LINE_CONTROL_PERIOD_MS;
                 g_line_lost_timing = false;
                 OLED_ShowString(3, 7, (uint8_t *)"LINE TRACK", 8);
                 DBG_Printf("-> LINE TRACK G:0x%02X\r\n", gray_map);
@@ -248,12 +256,12 @@ int main(void)
 
         /* ========== S_LINE_TRACK: 循迹 ========== */
         if (g_state == S_LINE_TRACK) {
-            /* 入场减速：倒计到0后恢复正常速度 */
-            if (g_track_entry > 0) {
-                if (--g_track_entry == 0) {
-                    Line_SetBaseSpeed(LINE_SPEED_NORMAL);
-                    DBG_SendStr("LINE normal speed\r\n");
-                }
+            /* 入场减速使用系统毫秒计时，不受主循环和显示负载影响。 */
+            if (g_line_entry_active &&
+                elapsed_ms(g_line_entry_start_ms) >= LINE_ENTRY_MS) {
+                g_line_entry_active = false;
+                Line_SetBaseSpeed(LINE_SPEED_NORMAL);
+                DBG_SendStr("LINE normal speed\r\n");
             }
 
             /* 全灭期间改为两轮同速向前，避免沿最后转向量画大圈。 */
@@ -277,7 +285,11 @@ int main(void)
                 }
             } else {
                 g_line_lost_timing = false;
-                Line_Update(gray_map);
+                if (elapsed_ms(g_line_control_last_ms) >=
+                    LINE_CONTROL_PERIOD_MS) {
+                    g_line_control_last_ms = g_ms_ticks;
+                    Line_Update(gray_map, g_ms_ticks);
+                }
             }
 
             /* 降低 OLED/UART 刷新频率，避免阻塞导致循环计时抖动 */
@@ -318,7 +330,6 @@ int main(void)
                 DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) != 0 &&
                 wit_can_start()) {
                 Straight_Start(snap_yaw, g_ms_ticks);
-                g_wit_silent_loops = 0;
                 g_state = S_YAW;
                 OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
                 sprintf(g_buf, "YAW T:%.0f", Straight_GetTarget());
@@ -338,7 +349,6 @@ int main(void)
                 DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) != 0 &&
                 wit_can_start()) {
                 Straight_Start(snap_yaw, g_ms_ticks);
-                g_wit_silent_loops = 0;
                 g_state = S_LINE_STRAIGHT;
                 OLED_CLR(4); OLED_CLR(5); OLED_CLR(6);
                 sprintf(g_buf, "YAW T:%.0f", Straight_GetTarget());

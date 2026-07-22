@@ -13,10 +13,10 @@
 void Line_Config(float kp, float ki, float kd, int16_t base_speed);
 
 /* 启动: 复位 PID, 使能电机 */
-void Line_Start(void);
+void Line_Start(uint32_t now_ms);
 
-/* 每帧更新: 传入灰度位图，输出电机控制 */
-void Line_Update(uint8_t gray_map);
+/* 每个控制周期更新: 传入灰度位图和当前 SysTick 毫秒数 */
+void Line_Update(uint8_t gray_map, uint32_t now_ms);
 
 /* 停止 */
 void Line_Stop(void);
