@@ -18,7 +18,7 @@
 
 #define SPEED_KP                        0.08f /* 比例：速度误差每 1 脉冲/秒产生的 PWM 修正 */
 #define SPEED_KI                        0.15f /* 积分：消除负载和电池变化造成的持续速度误差 */
-#define SPEED_INTEGRAL_LIMIT         1800.0f /* 积分误差限幅，单位为 脉冲/秒*秒 */
+#define SPEED_INTEGRAL_LIMIT         1800.0f /* 积分误差限幅，单位为 脉冲/秒 */
 #define SPEED_CORRECTION_LIMIT        350.0f /* PI 对原始 PWM 的最大修正量 */
 
 #define SPEED_FILTER_ALPHA              0.40f /* 新速度样本权重；越小越平滑但响应越慢 */
