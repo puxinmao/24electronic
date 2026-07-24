@@ -14,13 +14,10 @@ static uint8_t  g_wit_cnt;
 static volatile bool g_wit_updated;
 static volatile bool g_wit_fault;
 
-#define WIT_IRQ_MASK (DL_UART_INTERRUPT_RX | DL_UART_INTERRUPT_RX_TIMEOUT_ERROR)
-#define WIT_ERROR_MASK (DL_UART_INTERRUPT_OVERRUN_ERROR | \
-                        DL_UART_INTERRUPT_PARITY_ERROR | \
-                        DL_UART_INTERRUPT_FRAMING_ERROR | \
-                        DL_UART_INTERRUPT_RX_TIMEOUT_ERROR | \
-                        DL_UART_INTERRUPT_NOISE_ERROR)
-#define WIT_ISR_BYTE_BUDGET 32
+#define WIT_IRQ_MASK (DL_UART_INTERRUPT_RX | DL_UART_INTERRUPT_RX_TIMEOUT_ERROR) /* WIT UART 接收所需中断源。 */
+#define WIT_ERROR_MASK (DL_UART_INTERRUPT_OVERRUN_ERROR | DL_UART_INTERRUPT_PARITY_ERROR | DL_UART_INTERRUPT_FRAMING_ERROR | DL_UART_INTERRUPT_RX_TIMEOUT_ERROR | DL_UART_INTERRUPT_NOISE_ERROR) /* WIT UART 接收故障标志集合。 */
+#define WIT_FATAL_ERROR_MASK (DL_UART_INTERRUPT_OVERRUN_ERROR | DL_UART_INTERRUPT_PARITY_ERROR | DL_UART_INTERRUPT_FRAMING_ERROR | DL_UART_INTERRUPT_NOISE_ERROR) /* 需要立即停车并恢复 UART 的严重接收错误。 */
+#define WIT_ISR_BYTE_BUDGET 32 /* 单次 UART 中断最多读取的字节数，限制中断占用时间。 */
 
 /* ========== 内部解析函数 ========== */
 
@@ -146,11 +143,9 @@ void UART1_IRQHandler(void)
     /* 错误位必须显式清除，否则噪声可能造成中断反复进入。 */
     if (errors != 0U) {
         DL_UART_clearInterruptStatus(UART_0_INST, errors);
-        if (errors & (DL_UART_INTERRUPT_OVERRUN_ERROR |
-                      DL_UART_INTERRUPT_PARITY_ERROR |
-                      DL_UART_INTERRUPT_FRAMING_ERROR |
-                      DL_UART_INTERRUPT_NOISE_ERROR)) {
+        if ((errors & WIT_FATAL_ERROR_MASK) != 0U) {
             g_wit_cnt = 0;
+            g_wit_fault = true;
         }
     }
 

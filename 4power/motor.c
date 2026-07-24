@@ -1,124 +1,131 @@
 /*
- * motor.c - 电机驱动实现 (TB6612FNG)
+ * motor.c - 四轮电机驱动实现 (双 TB6612FNG)
  *
- * 引脚 (SysConfig自动生成):
- *  左电机: AIN_1=PA16, AIN_2=PA17, PWM=PB4(TIMA1_CCP0)
- *  右电机: BIN_1=PA24, BIN_2=PA25, PWM=PB1(TIMA1_CCP1)
- *  STBY:   PB9
+ * 车轮编号: A=左前，B=左后，C=右后，D=右前。
  */
 #include "motor.h"
-#include "button.h"
 #include "ti_msp_dl_config.h"
 
-/* ========== 内部辅助 ========== */
+#include <stdbool.h>
 
-static inline void left_forward(void)
+#define MOTOR_A_FORWARD_INVERTED  0 /* A 左前轮：置 1 时交换正/反转方向。 */
+#define MOTOR_B_FORWARD_INVERTED  0 /* B 左后轮：置 1 时交换正/反转方向。 */
+#define MOTOR_C_FORWARD_INVERTED  0 /* C 右后轮：置 1 时交换正/反转方向。 */
+#define MOTOR_D_FORWARD_INVERTED  0 /* D 右前轮：置 1 时交换正/反转方向。 */
+
+typedef struct {
+    GPIO_Regs *in1_port;
+    uint32_t in1_pin;
+    GPIO_Regs *in2_port;
+    uint32_t in2_pin;
+    GPTIMER_Regs *pwm_timer;
+    DL_TIMER_CC_INDEX pwm_channel;
+    bool forward_inverted;
+} MotorChannel_t;
+
+static const MotorChannel_t sMotors[MOTOR_WHEEL_COUNT] = {
+    { GPIO_MOTOR_AIN_1_PORT, GPIO_MOTOR_AIN_1_PIN,
+      GPIO_MOTOR_AIN_2_PORT, GPIO_MOTOR_AIN_2_PIN,
+      PWM_INST, GPIO_PWM_C0_IDX, MOTOR_A_FORWARD_INVERTED != 0 },
+    { GPIO_MOTOR_BIN_1_PORT, GPIO_MOTOR_BIN_1_PIN,
+      GPIO_MOTOR_BIN_2_PORT, GPIO_MOTOR_BIN_2_PIN,
+      PWM_INST, GPIO_PWM_C1_IDX, MOTOR_B_FORWARD_INVERTED != 0 },
+    { GPIO_MOTOR_CIN_1_PORT, GPIO_MOTOR_CIN_1_PIN,
+      GPIO_MOTOR_CIN_2_PORT, GPIO_MOTOR_CIN_2_PIN,
+      PWM_1_INST, GPIO_PWM_1_C0_IDX, MOTOR_C_FORWARD_INVERTED != 0 },
+    { GPIO_MOTOR_DIN_1_PORT, GPIO_MOTOR_DIN_1_PIN,
+      GPIO_MOTOR_DIN_2_PORT, GPIO_MOTOR_DIN_2_PIN,
+      PWM_1_INST, GPIO_PWM_1_C1_IDX, MOTOR_D_FORWARD_INVERTED != 0 }
+};
+
+static void motor_set_direction(const MotorChannel_t *motor,
+                                bool forward)
 {
-    DL_GPIO_setPins(GPIO_MOTOR_AIN_1_PORT, GPIO_MOTOR_AIN_1_PIN);
-    DL_GPIO_clearPins(GPIO_MOTOR_AIN_2_PORT, GPIO_MOTOR_AIN_2_PIN);
+    if (motor->forward_inverted) forward = !forward;
+
+    if (forward) {
+        DL_GPIO_setPins(motor->in1_port, motor->in1_pin);
+        DL_GPIO_clearPins(motor->in2_port, motor->in2_pin);
+    } else {
+        DL_GPIO_clearPins(motor->in1_port, motor->in1_pin);
+        DL_GPIO_setPins(motor->in2_port, motor->in2_pin);
+    }
 }
 
-static inline void left_reverse(void)
+static void motor_float(const MotorChannel_t *motor)
 {
-    DL_GPIO_clearPins(GPIO_MOTOR_AIN_1_PORT, GPIO_MOTOR_AIN_1_PIN);
-    DL_GPIO_setPins(GPIO_MOTOR_AIN_2_PORT, GPIO_MOTOR_AIN_2_PIN);
+    DL_GPIO_clearPins(motor->in1_port, motor->in1_pin);
+    DL_GPIO_clearPins(motor->in2_port, motor->in2_pin);
 }
 
-static inline void left_brake(void)
+static void motor_brake(const MotorChannel_t *motor)
 {
-    DL_GPIO_setPins(GPIO_MOTOR_AIN_1_PORT, GPIO_MOTOR_AIN_1_PIN);
-    DL_GPIO_setPins(GPIO_MOTOR_AIN_2_PORT, GPIO_MOTOR_AIN_2_PIN);
+    DL_GPIO_setPins(motor->in1_port, motor->in1_pin);
+    DL_GPIO_setPins(motor->in2_port, motor->in2_pin);
+    DL_Timer_setCaptureCompareValue(motor->pwm_timer, 0,
+                                    motor->pwm_channel);
 }
-
-static inline void left_float(void)
-{
-    DL_GPIO_clearPins(GPIO_MOTOR_AIN_1_PORT, GPIO_MOTOR_AIN_1_PIN);
-    DL_GPIO_clearPins(GPIO_MOTOR_AIN_2_PORT, GPIO_MOTOR_AIN_2_PIN);
-}
-
-static inline void right_forward(void)
-{
-    DL_GPIO_setPins(GPIO_MOTOR_BIN_1_PORT, GPIO_MOTOR_BIN_1_PIN);
-    DL_GPIO_clearPins(GPIO_MOTOR_BIN_2_PORT, GPIO_MOTOR_BIN_2_PIN);
-}
-
-static inline void right_reverse(void)
-{
-    DL_GPIO_clearPins(GPIO_MOTOR_BIN_1_PORT, GPIO_MOTOR_BIN_1_PIN);
-    DL_GPIO_setPins(GPIO_MOTOR_BIN_2_PORT, GPIO_MOTOR_BIN_2_PIN);
-}
-
-static inline void right_brake(void)
-{
-    DL_GPIO_setPins(GPIO_MOTOR_BIN_1_PORT, GPIO_MOTOR_BIN_1_PIN);
-    DL_GPIO_setPins(GPIO_MOTOR_BIN_2_PORT, GPIO_MOTOR_BIN_2_PIN);
-}
-
-static inline void right_float(void)
-{
-    DL_GPIO_clearPins(GPIO_MOTOR_BIN_1_PORT, GPIO_MOTOR_BIN_1_PIN);
-    DL_GPIO_clearPins(GPIO_MOTOR_BIN_2_PORT, GPIO_MOTOR_BIN_2_PIN);
-}
-
-/* ========== 公开接口 ========== */
 
 void Motor_Init(void)
 {
-    /* SysConfig 已配置 GPIO 和 PWM，只需确保停止 */
     Motor_Brake();
     Motor_Standby();
+    DL_TimerA_startCounter(PWM_INST);
+    DL_TimerG_startCounter(PWM_1_INST);
+}
+
+void Motor_SetWheel(MotorWheel_t wheel, int16_t speed)
+{
+    const MotorChannel_t *motor;
+    int32_t magnitude;
+    bool forward;
+
+    if ((uint32_t)wheel >= MOTOR_WHEEL_COUNT) return;
+    motor = &sMotors[wheel];
+    magnitude = speed;
+    forward = (magnitude >= 0);
+    if (magnitude < 0) magnitude = -magnitude;
+    if (magnitude > MOTOR_PWM_MAX) magnitude = MOTOR_PWM_MAX;
+
+    if (magnitude == 0) {
+        motor_float(motor);
+    } else {
+        motor_set_direction(motor, forward);
+    }
+
+    DL_Timer_setCaptureCompareValue(motor->pwm_timer, (uint32_t)magnitude,
+                                    motor->pwm_channel);
+}
+
+void Motor_SetFour(int16_t a, int16_t b, int16_t c, int16_t d)
+{
+    Motor_SetWheel(MOTOR_WHEEL_A_LEFT_FRONT, a);
+    Motor_SetWheel(MOTOR_WHEEL_B_LEFT_REAR, b);
+    Motor_SetWheel(MOTOR_WHEEL_C_RIGHT_REAR, c);
+    Motor_SetWheel(MOTOR_WHEEL_D_RIGHT_FRONT, d);
 }
 
 void Motor_SetLeft(int16_t speed)
 {
-    uint16_t pwm_val;
-    bool neg = (speed < 0);
-    if (neg) speed = -speed;
-    if (speed > MOTOR_PWM_MAX) speed = MOTOR_PWM_MAX;
-    pwm_val = (uint16_t)speed;
-
-    if (pwm_val == 0) {
-        left_float();
-    } else if (neg) {
-        left_reverse();
-    } else {
-        left_forward();
-    }
-
-    DL_TimerA_setCaptureCompareValue(PWM_INST, pwm_val, DL_TIMER_CC_0_INDEX);
+    Motor_SetWheel(MOTOR_WHEEL_A_LEFT_FRONT, speed);
+    Motor_SetWheel(MOTOR_WHEEL_B_LEFT_REAR, speed);
 }
 
 void Motor_SetRight(int16_t speed)
 {
-    uint16_t pwm_val;
-    bool neg = (speed < 0);
-    if (neg) speed = -speed;
-    if (speed > MOTOR_PWM_MAX) speed = MOTOR_PWM_MAX;
-    pwm_val = (uint16_t)speed;
-
-    if (pwm_val == 0) {
-        right_float();
-    } else if (neg) {
-        right_reverse();
-    } else {
-        right_forward();
-    }
-
-    DL_TimerA_setCaptureCompareValue(PWM_INST, pwm_val, DL_TIMER_CC_1_INDEX);
+    Motor_SetWheel(MOTOR_WHEEL_C_RIGHT_REAR, speed);
+    Motor_SetWheel(MOTOR_WHEEL_D_RIGHT_FRONT, speed);
 }
 
 void Motor_SetBoth(int16_t left, int16_t right)
 {
-    Motor_SetLeft(left);
-    Motor_SetRight(right);
+    Motor_SetFour(left, left, right, right);
 }
 
 void Motor_Brake(void)
 {
-    left_brake();
-    right_brake();
-    DL_TimerA_setCaptureCompareValue(PWM_INST, 0, DL_TIMER_CC_0_INDEX);
-    DL_TimerA_setCaptureCompareValue(PWM_INST, 0, DL_TIMER_CC_1_INDEX);
+    uint32_t i;
+    for (i = 0; i < MOTOR_WHEEL_COUNT; i++) motor_brake(&sMotors[i]);
 }
 
 void Motor_Standby(void)
@@ -128,13 +135,5 @@ void Motor_Standby(void)
 
 void Motor_Enable(void)
 {
-    uint32_t primask = __get_PRIMASK();
-    __disable_irq();
-
-    if (!Button_EStopIsPending() &&
-        DL_GPIO_readPins(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN) != 0U) {
-        DL_GPIO_setPins(GPIO_MOTOR_STBY_PORT, GPIO_MOTOR_STBY_PIN);
-    }
-
-    if (primask == 0U) __enable_irq();
+    DL_GPIO_setPins(GPIO_MOTOR_STBY_PORT, GPIO_MOTOR_STBY_PIN);
 }

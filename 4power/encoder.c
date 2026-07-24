@@ -1,150 +1,144 @@
 /*
- * encoder.c - 霍尔编码器 4x 解码
+ * encoder.c - 四轮霍尔编码器 AB 相 4 倍频解码
  *
- * 使用 AB 相查表法判断方向:
- *   正转: AB 序列 → 00→10→11→01→00...
- *   反转: AB 序列 → 00→01→11→10→00...
- *   每次边沿变化查表: +1(正转) / -1(反转) / 0(非法跳变)
- *
- * 中断: GROUP1_IRQHandler 同时处理 LA(PB7), LB(PB6), RA(PB0), RB(PB16)
- *       全部在 GPIOB 上，双边沿触发
+ * 车轮编号: A=左前，B=左后，C=右后，D=右前。
  */
 #include "encoder.h"
-#include "button.h"
 #include "ti_msp_dl_config.h"
 
-/* 编码器状态 */
-static volatile int32_t gEncLeft  = 0;
-static volatile int32_t gEncRight = 0;
+#include <stdbool.h>
 
-/* 速度计算：记录上一次位置和时间 */
-static int32_t gEncLeftPrev  = 0;
-static int32_t gEncRightPrev = 0;
+#define ENCODER_A_DIRECTION_INVERTED  0 /* A 左前编码器：置 1 时反转计数符号。 */
+#define ENCODER_B_DIRECTION_INVERTED  0 /* B 左后编码器：置 1 时反转计数符号。 */
+#define ENCODER_C_DIRECTION_INVERTED  0 /* C 右后编码器：置 1 时反转计数符号。 */
+#define ENCODER_D_DIRECTION_INVERTED  0 /* D 右前编码器：置 1 时反转计数符号。 */
 
-/* ========== 查表 ========== */
+typedef struct {
+    GPIO_Regs *a_port;
+    uint32_t a_pin;
+    GPIO_Regs *b_port;
+    uint32_t b_pin;
+    volatile int32_t count;
+    uint8_t state;
+    int8_t direction;
+} EncoderChannel_t;
 
-/*
- * 4x 解码查表:
- *   idx = (prev_state << 2) | curr_state
- *   state = (B << 1) | A
- *   返回值: +1=正转一个脉冲, -1=反转一个脉冲, 0=无效
- */
-static const int8_t enc4x_table[16] = {
-    /* prev\curr   00      01      10      11  */
-    /*  00    */    0,     -1,     +1,      0,
-    /*  01    */   +1,      0,      0,     -1,
-    /*  10    */   -1,      0,      0,     +1,
-    /*  11    */    0,     +1,     -1,      0
+static EncoderChannel_t sEncoders[ENCODER_COUNT] = {
+    { GPIO_AB_ALA_PORT, GPIO_AB_ALA_PIN, GPIO_AB_ALB_PORT, GPIO_AB_ALB_PIN,
+      0, 0, ENCODER_A_DIRECTION_INVERTED ? -1 : 1 },
+    { GPIO_AB_BRA_PORT, GPIO_AB_BRA_PIN, GPIO_AB_BRB_PORT, GPIO_AB_BRB_PIN,
+      0, 0, ENCODER_B_DIRECTION_INVERTED ? -1 : 1 },
+    { GPIO_AB_CLA_PORT, GPIO_AB_CLA_PIN, GPIO_AB_CLB_PORT, GPIO_AB_CLB_PIN,
+      0, 0, ENCODER_C_DIRECTION_INVERTED ? -1 : 1 },
+    { GPIO_AB_DRA_PORT, GPIO_AB_DRA_PIN, GPIO_AB_DRB_PORT, GPIO_AB_DRB_PIN,
+      0, 0, ENCODER_D_DIRECTION_INVERTED ? -1 : 1 }
 };
 
-/* 上一次 AB 状态 */
-static uint8_t gLeftState  = 0;  /* bit1=LB, bit0=LA */
-static uint8_t gRightState = 0;  /* bit1=RB, bit0=RA */
+/* 索引为 (旧 AB << 2) | 新 AB，state=(B << 1) | A。 */
+static const int8_t sDecode4x[16] = {
+     0, -1, +1,  0,
+    +1,  0,  0, -1,
+    -1,  0,  0, +1,
+     0, +1, -1,  0
+};
 
-/* ========== 公开函数 ========== */
+static uint8_t encoder_read_state(const EncoderChannel_t *encoder,
+                                  uint32_t pins_a, uint32_t pins_b)
+{
+    uint8_t state = 0;
+    uint32_t a_pins = (encoder->a_port == GPIOA) ? pins_a : pins_b;
+    uint32_t b_pins = (encoder->b_port == GPIOA) ? pins_a : pins_b;
+    if ((a_pins & encoder->a_pin) != 0U) state |= 1U;
+    if ((b_pins & encoder->b_pin) != 0U) state |= 2U;
+    return state;
+}
+
+static void encoder_process(EncoderChannel_t *encoder,
+                            uint32_t status_a, uint32_t status_b,
+                            uint32_t pins_a, uint32_t pins_b)
+{
+    bool changed = false;
+
+    if (encoder->a_port == GPIOA) changed |= (status_a & encoder->a_pin) != 0U;
+    else                          changed |= (status_b & encoder->a_pin) != 0U;
+    if (encoder->b_port == GPIOA) changed |= (status_a & encoder->b_pin) != 0U;
+    else                          changed |= (status_b & encoder->b_pin) != 0U;
+    if (!changed) return;
+
+    uint8_t current = encoder_read_state(encoder, pins_a, pins_b);
+    uint8_t index = (uint8_t)((encoder->state << 2) | current);
+    encoder->count += (int32_t)(sDecode4x[index] * encoder->direction);
+    encoder->state = current;
+}
 
 void Encoder_Init(void)
 {
-    /* 读取初始状态 */
-    uint32_t in = DL_GPIO_readPins(GPIOB,
-        DL_GPIO_PIN_0 | DL_GPIO_PIN_7 | DL_GPIO_PIN_6 | DL_GPIO_PIN_16);
+    uint32_t i;
+    const uint32_t mask_a = GPIO_AB_ALA_PIN | GPIO_AB_ALB_PIN |
+                            GPIO_AB_BRA_PIN | GPIO_AB_BRB_PIN |
+                            GPIO_AB_CLA_PIN | GPIO_AB_DRB_PIN;
+    const uint32_t mask_b = GPIO_AB_CLB_PIN | GPIO_AB_DRA_PIN;
+    uint32_t pins_a = DL_GPIO_readPins(GPIOA, mask_a);
+    uint32_t pins_b = DL_GPIO_readPins(GPIOB, mask_b);
 
-    gLeftState  = 0;
-    if (in & DL_GPIO_PIN_7)  gLeftState  |= 1;  /* LA */
-    if (in & DL_GPIO_PIN_6)  gLeftState  |= 2;  /* LB */
-    gRightState = 0;
-    if (in & DL_GPIO_PIN_0)  gRightState |= 1;  /* RA */
-    if (in & DL_GPIO_PIN_16) gRightState |= 2;  /* RB */
+    for (i = 0; i < ENCODER_COUNT; i++) {
+        sEncoders[i].state = encoder_read_state(&sEncoders[i],
+                                                 pins_a, pins_b);
+    }
 
-    gEncLeftPrev  = gEncLeft;
-    gEncRightPrev = gEncRight;
-
-    /* SysConfig 已配置 LA 中断，这里补上 RA + LB + RB */
-    DL_GPIO_setLowerPinsPolarity(GPIOB,
-        DL_GPIO_PIN_0_EDGE_RISE_FALL |
-        DL_GPIO_PIN_6_EDGE_RISE_FALL |
-        DL_GPIO_PIN_7_EDGE_RISE_FALL);
-    DL_GPIO_setUpperPinsPolarity(GPIOB,
-        DL_GPIO_PIN_16_EDGE_RISE_FALL);
-
-    DL_GPIO_clearInterruptStatus(GPIOB,
-        DL_GPIO_PIN_0 | DL_GPIO_PIN_7 | DL_GPIO_PIN_6 | DL_GPIO_PIN_16);
-    DL_GPIO_enableInterrupt(GPIOB,
-        DL_GPIO_PIN_0 | DL_GPIO_PIN_7 | DL_GPIO_PIN_6 | DL_GPIO_PIN_16);
+    DL_GPIO_clearInterruptStatus(GPIOA, mask_a);
+    DL_GPIO_clearInterruptStatus(GPIOB, mask_b);
+    DL_GPIO_enableInterrupt(GPIOA, mask_a);
+    DL_GPIO_enableInterrupt(GPIOB, mask_b);
+    NVIC_SetPriority(GPIOA_INT_IRQn, 1);
+    NVIC_SetPriority(GPIOB_INT_IRQn, 1);
+    NVIC_EnableIRQ(GPIOA_INT_IRQn);
     NVIC_EnableIRQ(GPIOB_INT_IRQn);
 }
 
-int32_t Encoder_GetLeft(void)  { return gEncLeft; }
-int32_t Encoder_GetRight(void) { return gEncRight; }
-
-void Encoder_GetCounts(int32_t *left, int32_t *right)
+void Encoder_GetCounts(int32_t counts[ENCODER_COUNT])
 {
+    uint32_t i;
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
-    *left = gEncLeft;
-    *right = gEncRight;
+    for (i = 0; i < ENCODER_COUNT; i++) counts[i] = sEncoders[i].count;
     if (primask == 0U) __enable_irq();
-}
-
-int16_t Encoder_GetLeftSpeed(float dt)
-{
-    int32_t delta = gEncLeft - gEncLeftPrev;
-    gEncLeftPrev = gEncLeft;
-    if (dt <= 0.0f) return 0;
-    return (int16_t)((float)delta / dt);
-}
-
-int16_t Encoder_GetRightSpeed(float dt)
-{
-    int32_t delta = gEncRight - gEncRightPrev;
-    gEncRightPrev = gEncRight;
-    if (dt <= 0.0f) return 0;
-    return (int16_t)((float)delta / dt);
 }
 
 void Encoder_Reset(void)
 {
-    gEncLeft  = 0;
-    gEncRight = 0;
-    gEncLeftPrev  = 0;
-    gEncRightPrev = 0;
+    uint32_t i;
+    const uint32_t mask_a = GPIO_AB_ALA_PIN | GPIO_AB_ALB_PIN |
+                            GPIO_AB_BRA_PIN | GPIO_AB_BRB_PIN |
+                            GPIO_AB_CLA_PIN | GPIO_AB_DRB_PIN;
+    const uint32_t mask_b = GPIO_AB_CLB_PIN | GPIO_AB_DRA_PIN;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    uint32_t pins_a = DL_GPIO_readPins(GPIOA, mask_a);
+    uint32_t pins_b = DL_GPIO_readPins(GPIOB, mask_b);
+    for (i = 0; i < ENCODER_COUNT; i++) {
+        sEncoders[i].count = 0;
+        sEncoders[i].state = encoder_read_state(&sEncoders[i],
+                                                 pins_a, pins_b);
+    }
+    if (primask == 0U) __enable_irq();
 }
-
-/* ========== GPIOB 中断处理（GROUP1） ========== */
 
 void GROUP1_IRQHandler(void)
 {
-    /* GPIOA and GPIOB share GROUP1. KEY2 emergency stop has priority. */
-    (void)Button_EStopHandleIRQ();
+    uint32_t i;
+    const uint32_t mask_a = GPIO_AB_ALA_PIN | GPIO_AB_ALB_PIN |
+                            GPIO_AB_BRA_PIN | GPIO_AB_BRB_PIN |
+                            GPIO_AB_CLA_PIN | GPIO_AB_DRB_PIN;
+    const uint32_t mask_b = GPIO_AB_CLB_PIN | GPIO_AB_DRA_PIN;
+    uint32_t status_a = DL_GPIO_getEnabledInterruptStatus(GPIOA, mask_a);
+    uint32_t status_b = DL_GPIO_getEnabledInterruptStatus(GPIOB, mask_b);
+    uint32_t pins_a = DL_GPIO_readPins(GPIOA, mask_a);
+    uint32_t pins_b = DL_GPIO_readPins(GPIOB, mask_b);
 
-    uint32_t status = DL_GPIO_getEnabledInterruptStatus(GPIOB,
-        DL_GPIO_PIN_0 | DL_GPIO_PIN_7 | DL_GPIO_PIN_6 | DL_GPIO_PIN_16);
-
-    /* 读取当前电平 */
-    uint32_t pins = DL_GPIO_readPins(GPIOB,
-        DL_GPIO_PIN_0 | DL_GPIO_PIN_7 | DL_GPIO_PIN_6 | DL_GPIO_PIN_16);
-
-    /* 左编码器 */
-    if (status & (DL_GPIO_PIN_7 | DL_GPIO_PIN_6)) {
-        DL_GPIO_clearInterruptStatus(GPIOB, DL_GPIO_PIN_7 | DL_GPIO_PIN_6);
-
-        uint8_t cur = 0;
-        if (pins & DL_GPIO_PIN_7) cur |= 1;   /* LA = bit0 */
-        if (pins & DL_GPIO_PIN_6) cur |= 2;   /* LB = bit1 */
-        int8_t idx = (gLeftState << 2) | cur;
-        gEncLeft += enc4x_table[idx];
-        gLeftState = cur;
-    }
-
-    /* 右编码器 */
-    if (status & (DL_GPIO_PIN_0 | DL_GPIO_PIN_16)) {
-        DL_GPIO_clearInterruptStatus(GPIOB, DL_GPIO_PIN_0 | DL_GPIO_PIN_16);
-
-        uint8_t cur = 0;
-        if (pins & DL_GPIO_PIN_0)  cur |= 1;   /* RA = bit0 */
-        if (pins & DL_GPIO_PIN_16) cur |= 2;   /* RB = bit1 */
-        int8_t idx = (gRightState << 2) | cur;
-        gEncRight += enc4x_table[idx];
-        gRightState = cur;
+    if (status_a != 0U) DL_GPIO_clearInterruptStatus(GPIOA, status_a);
+    if (status_b != 0U) DL_GPIO_clearInterruptStatus(GPIOB, status_b);
+    for (i = 0; i < ENCODER_COUNT; i++) {
+        encoder_process(&sEncoders[i], status_a, status_b, pins_a, pins_b);
     }
 }

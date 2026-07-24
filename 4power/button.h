@@ -1,24 +1,16 @@
 /*
- * button.h - 按键扫描模块
+ * button.h - KEY1 按键扫描模块
  */
 #ifndef BUTTON_H
 #define BUTTON_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "ti_msp_dl_config.h"
 
-/* 消抖 50ms + 等释放 (300ms 超时)，返回是否按下 */
+/* 低电平按下，消抖 50 ms，并等待释放（最长 300 ms）。 */
 bool Button_IsPressed(GPIO_Regs *port, uint32_t pin);
 
-/* KEY2 hardware emergency stop (PA15, falling edge). */
-void Button_EStopInit(void);
-bool Button_EStopHandleIRQ(void);
-bool Button_EStopIsPending(void);
-bool Button_EStopTakeEvent(void);
+#define KEY1_PRESSED  Button_IsPressed(GPIO_IO_KEY1_PORT, GPIO_IO_KEY1_PIN) /* 仅 KEY1 绑定启动功能。 */
 
-#define KEY1_PRESSED  Button_IsPressed(GPIO_IO_KEY1_PORT, GPIO_IO_KEY1_PIN)
-#define KEY2_PRESSED  Button_IsPressed(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN)
-#define KEY3_PRESSED  Button_IsPressed(GPIO_IO_KEY3_PORT, GPIO_IO_KEY3_PIN)
-
-#endif
+#endif /* BUTTON_H */

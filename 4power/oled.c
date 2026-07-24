@@ -7,7 +7,7 @@
 #include "oledfont.h"
 #include "ti_msp_dl_config.h"
 
-#define I2C_WAIT_LOOP_LIMIT  (CPUCLK_FREQ / 500U)
+#define I2C_WAIT_LOOP_LIMIT  (CPUCLK_FREQ / 500U) /* I2C 单次等待的软件超时循环上限，防止总线异常时永久阻塞。 */
 
 /* ---------- 简单延时（使用 SysTick 风格） ---------- */
 static bool g_oled_available = true;

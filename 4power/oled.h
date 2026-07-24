@@ -9,8 +9,8 @@
 #include "ti_msp_dl_config.h"
 #include <stdint.h>
 
-#define OLED_CMD  0
-#define OLED_DATA 1
+#define OLED_CMD  0 /* OLED 控制字节类型：命令。 */
+#define OLED_DATA 1 /* OLED 控制字节类型：显示数据。 */
 
 void OLED_Init(void);
 void OLED_Clear(void);

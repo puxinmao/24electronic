@@ -1,30 +1,26 @@
 /*
- * encoder.h - 霍尔编码器模块 (4x 解码)
- *
- * 引脚: LA=PB7, LB=PB6 (左电机编码器)
- *       RA=PB0, RB=PB16 (右电机编码器)
- * 中断: GROUP1_IRQHandler (GPIOB, 双边沿触发)
+ * encoder.h - 四轮霍尔编码器模块 (AB 相 4 倍频解码)
  */
 #ifndef ENCODER_H
 #define ENCODER_H
 
 #include <stdint.h>
 
-/* 初始化编码器中断 */
+typedef enum {
+    ENCODER_A_LEFT_FRONT = 0,
+    ENCODER_B_LEFT_REAR,
+    ENCODER_C_RIGHT_REAR,
+    ENCODER_D_RIGHT_FRONT,
+    ENCODER_COUNT
+} EncoderWheel_t;
+
+/* 初始化 GPIOA/GPIOB 上的八路编码器边沿中断。 */
 void Encoder_Init(void);
 
-/* 获取累计位置 (脉冲数) */
-int32_t Encoder_GetLeft(void);
-int32_t Encoder_GetRight(void);
+/* 原子读取 A/B/C/D 四个车轮的累计 4 倍频脉冲数。 */
+void Encoder_GetCounts(int32_t counts[ENCODER_COUNT]);
 
-/* 原子读取左右轮累计位置，供双轮速度采样使用。 */
-void Encoder_GetCounts(int32_t *left, int32_t *right);
-
-/* 获取速度 (脉冲/s)，dt 为距离上次调用的秒数 */
-int16_t Encoder_GetLeftSpeed(float dt);
-int16_t Encoder_GetRightSpeed(float dt);
-
-/* 清零计数 */
+/* 清零四轮累计计数。 */
 void Encoder_Reset(void);
 
 #endif /* ENCODER_H */
