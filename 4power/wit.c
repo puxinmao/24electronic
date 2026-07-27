@@ -1,5 +1,5 @@
 /*
- * wit.c - JY901S 陀螺仪驱动 (UART1/PA9)
+ * wit.c - JY901S 陀螺仪驱动 (UART2/PB16 RX only)
  *
  * 使用 UART RX + RX_TIMEOUT 中断接收 11 字节帧，
  * 无需 DMA，直接在中断中解析。
@@ -76,15 +76,15 @@ static void wit_resync_packet(void)
 
 void WIT_Init(void)
 {
-    /* 开启 UART1 FIFO（当前 SysConfig 未配置，需要手动开） */
-    DL_UART_enableFIFOs(UART_0_INST);
+    /* 开启 UART2 FIFO（当前 SysConfig 未配置，需要手动开） */
+    DL_UART_enableFIFOs(UART_2_INST);
 
     /* 使能 RX 和 RX_TIMEOUT 中断 */
-    DL_UART_clearInterruptStatus(UART_0_INST, WIT_IRQ_MASK | WIT_ERROR_MASK);
-    DL_UART_enableInterrupt(UART_0_INST, WIT_IRQ_MASK);
+    DL_UART_clearInterruptStatus(UART_2_INST, WIT_IRQ_MASK | WIT_ERROR_MASK);
+    DL_UART_enableInterrupt(UART_2_INST, WIT_IRQ_MASK);
 
-    NVIC_SetPriority(UART_0_INST_INT_IRQN, 2);
-    NVIC_EnableIRQ(UART_0_INST_INT_IRQN);
+    NVIC_SetPriority(UART_2_INST_INT_IRQN, 2);
+    NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
 
     g_wit_cnt     = 0;
     g_wit_updated = false;
@@ -116,41 +116,41 @@ void WIT_Recover(void)
 {
     uint8_t flush_count = 0;
 
-    NVIC_DisableIRQ(UART_0_INST_INT_IRQN);
-    DL_UART_disableInterrupt(UART_0_INST, WIT_IRQ_MASK);
+    NVIC_DisableIRQ(UART_2_INST_INT_IRQN);
+    DL_UART_disableInterrupt(UART_2_INST, WIT_IRQ_MASK);
 
-    while (!DL_UART_isRXFIFOEmpty(UART_0_INST) && flush_count < 32) {
-        (void)DL_UART_receiveData(UART_0_INST);
+    while (!DL_UART_isRXFIFOEmpty(UART_2_INST) && flush_count < 32) {
+        (void)DL_UART_receiveData(UART_2_INST);
         flush_count++;
     }
 
     g_wit_cnt     = 0;
     g_wit_updated = false;
     g_wit_fault   = false;
-    DL_UART_clearInterruptStatus(UART_0_INST, WIT_IRQ_MASK | WIT_ERROR_MASK);
-    NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
-    DL_UART_enableInterrupt(UART_0_INST, WIT_IRQ_MASK);
-    NVIC_EnableIRQ(UART_0_INST_INT_IRQN);
+    DL_UART_clearInterruptStatus(UART_2_INST, WIT_IRQ_MASK | WIT_ERROR_MASK);
+    NVIC_ClearPendingIRQ(UART_2_INST_INT_IRQN);
+    DL_UART_enableInterrupt(UART_2_INST, WIT_IRQ_MASK);
+    NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
 }
 
-/* ========== UART1 中断处理 ========== */
+/* ========== UART2 中断处理 ========== */
 
-void UART1_IRQHandler(void)
+void UART2_IRQHandler(void)
 {
     uint8_t budget = WIT_ISR_BYTE_BUDGET;
-    uint32_t errors = DL_UART_getRawInterruptStatus(UART_0_INST, WIT_ERROR_MASK);
+    uint32_t errors = DL_UART_getRawInterruptStatus(UART_2_INST, WIT_ERROR_MASK);
 
     /* 错误位必须显式清除，否则噪声可能造成中断反复进入。 */
     if (errors != 0U) {
-        DL_UART_clearInterruptStatus(UART_0_INST, errors);
+        DL_UART_clearInterruptStatus(UART_2_INST, errors);
         if ((errors & WIT_FATAL_ERROR_MASK) != 0U) {
             g_wit_cnt = 0;
             g_wit_fault = true;
         }
     }
 
-    while (!DL_UART_isRXFIFOEmpty(UART_0_INST) && budget-- > 0U) {
-        uint8_t byte = DL_UART_receiveData(UART_0_INST);
+    while (!DL_UART_isRXFIFOEmpty(UART_2_INST) && budget-- > 0U) {
+        uint8_t byte = DL_UART_receiveData(UART_2_INST);
 
         /* 只在等待帧头时识别 0x55；帧负载中的 0x55 是合法数据。 */
         if (g_wit_cnt == 0U) {
@@ -164,11 +164,11 @@ void UART1_IRQHandler(void)
         }
     }
 
-    DL_UART_clearInterruptStatus(UART_0_INST, WIT_IRQ_MASK | WIT_ERROR_MASK);
+    DL_UART_clearInterruptStatus(UART_2_INST, WIT_IRQ_MASK | WIT_ERROR_MASK);
 
     /* 正常 FIFO 不会超过预算；持续有数据说明线路受到严重干扰。 */
-    if (!DL_UART_isRXFIFOEmpty(UART_0_INST)) {
-        DL_UART_disableInterrupt(UART_0_INST, WIT_IRQ_MASK);
+    if (!DL_UART_isRXFIFOEmpty(UART_2_INST)) {
+        DL_UART_disableInterrupt(UART_2_INST, WIT_IRQ_MASK);
         g_wit_fault = true;
     }
 }

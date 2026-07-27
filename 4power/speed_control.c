@@ -11,10 +11,10 @@
 #define SPEED_PI_DT_MAX               0.100f /* 阻塞后参与积分的最大 dt，避免积分突变。 */
 #define SPEED_FULL_OUTPUT_PPS        5680.0f /* 最强输出时估计的 4 倍频脉冲/秒，需按实车校准。 */
 
-#define SPEED_A_TARGET_SCALE             1.0f /* A 左前轮目标速度比例。 */
-#define SPEED_B_TARGET_SCALE             1.0f /* B 左后轮目标速度比例。 */
-#define SPEED_C_TARGET_SCALE             1.0f /* C 右后轮目标速度比例。 */
-#define SPEED_D_TARGET_SCALE             1.0f /* D 右前轮目标速度比例。 */
+#define SPEED_A_TARGET_SCALE             1.0f /* A 右后速度比例。 */
+#define SPEED_B_TARGET_SCALE             1.0f /* B 右前标速度比例。 */
+#define SPEED_C_TARGET_SCALE             1.0f /* C 左前速度比例。 */
+#define SPEED_D_TARGET_SCALE             1.0f /* D 左后轮目标速度比例。 */
 
 #define SPEED_KP                         0.08f /* 速度 PI 比例系数。 */
 #define SPEED_KI                         0.15f /* 速度 PI 积分系数。 */
@@ -214,10 +214,10 @@ void SpeedControl_Start(uint32_t now_ms)
 void SpeedControl_SetCommand(int16_t left, int16_t right)
 {
     if (!sRunning || sFault != SPEED_CONTROL_FAULT_NONE) return;
-    speed_set_wheel_command(MOTOR_WHEEL_A_LEFT_FRONT, left);
-    speed_set_wheel_command(MOTOR_WHEEL_B_LEFT_REAR, left);
-    speed_set_wheel_command(MOTOR_WHEEL_C_RIGHT_REAR, right);
-    speed_set_wheel_command(MOTOR_WHEEL_D_RIGHT_FRONT, right);
+    speed_set_wheel_command(MOTOR_WHEEL_C_LEFT_FRONT, left);
+    speed_set_wheel_command(MOTOR_WHEEL_D_LEFT_REAR, left);
+    speed_set_wheel_command(MOTOR_WHEEL_A_RIGHT_REAR, right);
+    speed_set_wheel_command(MOTOR_WHEEL_B_RIGHT_FRONT, right);
     speed_apply_outputs();
 }
 

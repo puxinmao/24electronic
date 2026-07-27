@@ -8,10 +8,10 @@
 
 #include <stdbool.h>
 
-#define ENCODER_A_DIRECTION_INVERTED  0 /* A 左前编码器：置 1 时反转计数符号。 */
-#define ENCODER_B_DIRECTION_INVERTED  0 /* B 左后编码器：置 1 时反转计数符号。 */
-#define ENCODER_C_DIRECTION_INVERTED  0 /* C 右后编码器：置 1 时反转计数符号。 */
-#define ENCODER_D_DIRECTION_INVERTED  0 /* D 右前编码器：置 1 时反转计数符号。 */
+#define ENCODER_A_DIRECTION_INVERTED  1 /* A 右后编码器：置 1 时反转计数符号。 */
+#define ENCODER_B_DIRECTION_INVERTED  1 /* B 后前编码器：置 1 时反转计数符号。 */
+#define ENCODER_C_DIRECTION_INVERTED  1 /* C 左前编码器：置 1 时反转计数符号。 */
+#define ENCODER_D_DIRECTION_INVERTED  1 /* D 左后编码器：置 1 时反转计数符号。 */
 
 typedef struct {
     GPIO_Regs *a_port;

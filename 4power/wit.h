@@ -1,5 +1,5 @@
 /*
- * wit.h - JY901S 陀螺仪模块 (UART1/PA9, 115200bps)
+ * wit.h - JY901S 陀螺仪模块 (UART2/PB16 RX only, 115200bps)
  *
  * 协议: 每帧 11 字节，帧头 0x55
  *   0x51 → 加速度 + 温度

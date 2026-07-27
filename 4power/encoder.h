@@ -7,10 +7,10 @@
 #include <stdint.h>
 
 typedef enum {
-    ENCODER_A_LEFT_FRONT = 0,
-    ENCODER_B_LEFT_REAR,
-    ENCODER_C_RIGHT_REAR,
-    ENCODER_D_RIGHT_FRONT,
+    ENCODER_A_RIGHT_REAR = 0,
+    ENCODER_B_RIGHT_FRONT,
+    ENCODER_C_LEFT_FRONT,
+    ENCODER_D_LEFT_REAR,
     ENCODER_COUNT
 } EncoderWheel_t;
 

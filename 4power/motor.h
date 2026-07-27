@@ -9,10 +9,10 @@
 #define MOTOR_PWM_MAX  2000 /* PWM 最大比较值，与 SysConfig 中两组 PWM 的 period=2000 一致。 */
 
 typedef enum {
-    MOTOR_WHEEL_A_LEFT_FRONT = 0,
-    MOTOR_WHEEL_B_LEFT_REAR,
-    MOTOR_WHEEL_C_RIGHT_REAR,
-    MOTOR_WHEEL_D_RIGHT_FRONT,
+    MOTOR_WHEEL_A_RIGHT_REAR = 0,
+    MOTOR_WHEEL_B_RIGHT_FRONT,
+    MOTOR_WHEEL_C_LEFT_FRONT,
+    MOTOR_WHEEL_D_LEFT_REAR,
     MOTOR_WHEEL_COUNT
 } MotorWheel_t;
 
@@ -22,7 +22,7 @@ void Motor_Init(void);
 /* 设置单轮指令，范围 [-MOTOR_PWM_MAX, MOTOR_PWM_MAX]，正值表示向前。 */
 void Motor_SetWheel(MotorWheel_t wheel, int16_t speed);
 
-/* 按 A/B/C/D（左前/左后/右后/右前）顺序设置四个车轮。 */
+/* 按 A/B/C/D（右后/右前/左前/左后）顺序设置四个车轮。 */
 void Motor_SetFour(int16_t a, int16_t b, int16_t c, int16_t d);
 
 /* 同侧两个车轮使用相同指令，保留已验证两轮代码的上层接口。 */

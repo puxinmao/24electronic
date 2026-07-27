@@ -1,17 +1,17 @@
 /*
  * motor.c - 四轮电机驱动实现 (双 TB6612FNG)
  *
- * 车轮编号: A=左前，B=左后，C=右后，D=右前。
+ * 车轮编号: A=右后，B=后前，C=左前，D=左后
  */
 #include "motor.h"
 #include "ti_msp_dl_config.h"
 
 #include <stdbool.h>
 
-#define MOTOR_A_FORWARD_INVERTED  0 /* A 左前轮：置 1 时交换正/反转方向。 */
-#define MOTOR_B_FORWARD_INVERTED  0 /* B 左后轮：置 1 时交换正/反转方向。 */
-#define MOTOR_C_FORWARD_INVERTED  0 /* C 右后轮：置 1 时交换正/反转方向。 */
-#define MOTOR_D_FORWARD_INVERTED  0 /* D 右前轮：置 1 时交换正/反转方向。 */
+#define MOTOR_A_FORWARD_INVERTED  1 /* A 右后轮：置 1 时交换正/反转方向。 */
+#define MOTOR_B_FORWARD_INVERTED  0 /* B 后前轮：置 1 时交换正/反转方向。 */
+#define MOTOR_C_FORWARD_INVERTED  0 /* C 左前轮：置 1 时交换正/反转方向。 */
+#define MOTOR_D_FORWARD_INVERTED  1 /* D 左后轮：置 1 时交换正/反转方向。 */
 
 typedef struct {
     GPIO_Regs *in1_port;
@@ -99,27 +99,27 @@ void Motor_SetWheel(MotorWheel_t wheel, int16_t speed)
 
 void Motor_SetFour(int16_t a, int16_t b, int16_t c, int16_t d)
 {
-    Motor_SetWheel(MOTOR_WHEEL_A_LEFT_FRONT, a);
-    Motor_SetWheel(MOTOR_WHEEL_B_LEFT_REAR, b);
-    Motor_SetWheel(MOTOR_WHEEL_C_RIGHT_REAR, c);
-    Motor_SetWheel(MOTOR_WHEEL_D_RIGHT_FRONT, d);
+    Motor_SetWheel(MOTOR_WHEEL_A_RIGHT_REAR, a);
+    Motor_SetWheel(MOTOR_WHEEL_B_RIGHT_FRONT, b);
+    Motor_SetWheel(MOTOR_WHEEL_C_LEFT_FRONT, c);
+    Motor_SetWheel(MOTOR_WHEEL_D_LEFT_REAR, d);
 }
 
 void Motor_SetLeft(int16_t speed)
 {
-    Motor_SetWheel(MOTOR_WHEEL_A_LEFT_FRONT, speed);
-    Motor_SetWheel(MOTOR_WHEEL_B_LEFT_REAR, speed);
+    Motor_SetWheel(MOTOR_WHEEL_C_LEFT_FRONT, speed);
+    Motor_SetWheel(MOTOR_WHEEL_D_LEFT_REAR, speed);
 }
 
 void Motor_SetRight(int16_t speed)
 {
-    Motor_SetWheel(MOTOR_WHEEL_C_RIGHT_REAR, speed);
-    Motor_SetWheel(MOTOR_WHEEL_D_RIGHT_FRONT, speed);
+    Motor_SetWheel(MOTOR_WHEEL_A_RIGHT_REAR, speed);
+    Motor_SetWheel(MOTOR_WHEEL_B_RIGHT_FRONT, speed);
 }
 
 void Motor_SetBoth(int16_t left, int16_t right)
 {
-    Motor_SetFour(left, left, right, right);
+    Motor_SetFour(right, right, left, left);
 }
 
 void Motor_Brake(void)
