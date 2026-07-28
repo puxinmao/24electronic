@@ -73,9 +73,9 @@ void Straight_Config(float kp, float ki, float kd, int16_t base_speed)
     sBaseSpeed = base_speed;
 }
 
-void Straight_Start(float current_yaw, uint32_t now_ms)
+static void straight_start(float target_yaw, uint32_t now_ms)
 {
-    sTargetYaw = current_yaw;
+    sTargetYaw = target_yaw;
     PID_Reset(&sPid);
     PID_SetSetpoint(&sPid, sTargetYaw);
     SpeedControl_Start(now_ms);
@@ -84,6 +84,16 @@ void Straight_Start(float current_yaw, uint32_t now_ms)
     sRampStarted = false;
     sStartMs = now_ms;
     sLastUpdateMs = now_ms;
+}
+
+void Straight_Start(float current_yaw, uint32_t now_ms)
+{
+    straight_start(current_yaw, now_ms);
+}
+
+void Straight_StartToYaw(float target_yaw, uint32_t now_ms)
+{
+    straight_start(target_yaw, now_ms);
 }
 
 float Straight_Update(float current_yaw, uint32_t now_ms)

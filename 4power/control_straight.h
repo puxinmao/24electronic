@@ -14,6 +14,7 @@ void Straight_Config(float kp, float ki, float kd, int16_t base_speed);
 
 /* 启动: 锁定 yaw 为目标；now_ms 使用系统 SysTick 毫秒计时。 */
 void Straight_Start(float current_yaw, uint32_t now_ms);
+void Straight_StartToYaw(float target_yaw, uint32_t now_ms);
 
 /* 收到新 yaw 时更新；now_ms 用于计算真实 PID 间隔和启动渐变。 */
 float Straight_Update(float current_yaw, uint32_t now_ms);
