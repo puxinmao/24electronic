@@ -1,16 +1,12 @@
 /*
- * empty.c - Four-wheel speed-loop test and line tracking.
+ * empty.c - 四轮速度闭环与 KEY1 循迹主程序。
  *
- * KEY1 locks the current gyro yaw to drive straight until a black line is
- * detected, then switches to line tracking. KEY2 starts line tracking
- * directly. Both line-tracking paths stop after the gray sensors have
- * continuously lost the black line for 200 ms.
+ * 按下 KEY1 后开始循迹，连续丢失黑线 200 ms 后停车。
  */
 #include "ti_msp_dl_config.h"
 
 #include "button.h"
 #include "control_line.h"
-#include "control_straight.h"
 #include "encoder.h"
 #include "gray.h"
 #include "motor.h"
@@ -18,22 +14,15 @@
 #include "speed_control.h"
 #include "wit.h"
 
-#define SENSOR_DISPLAY_PERIOD_MS  50U
-#define SYSTICK_PERIOD_MS         1U
+#define SENSOR_DISPLAY_PERIOD_MS  50U  /* OLED 与传感器状态刷新周期。 */
+#define SYSTICK_PERIOD_MS         1U   /* 系统 SysTick 的计时单位。 */
 
-#define STRAIGHT_CONTROL_PERIOD_MS 5U
-#define STRAIGHT_KP                 80.0f
-#define STRAIGHT_KI                  0.0f
-#define STRAIGHT_KD                  2.0f
-#define STRAIGHT_BASE_SPEED           700
-#define RETURN_STRAIGHT_DURATION_MS  5000U
-
-#define LINE_CONTROL_PERIOD_MS      5U
-#define LINE_LOST_STOP_MS           200U
-#define LINE_KP                     1200.0f
-#define LINE_KI                      0.0f
-#define LINE_KD                      8.0f
-#define LINE_BASE_SPEED             1000
+#define LINE_CONTROL_PERIOD_MS      5U      /* 循迹 PID 更新周期。 */
+#define LINE_LOST_STOP_MS           200U    /* 连续丢失黑线后停车的确认时间。 */
+#define LINE_KP                     1200.0f /* 循迹 PID 比例系数。 */
+#define LINE_KI                      0.0f   /* 循迹 PID 积分系数。 */
+#define LINE_KD                      8.0f   /* 循迹 PID 微分系数。 */
+#define LINE_BASE_SPEED             1300    /* 循迹基础 PWM，数值越小速度越快。 */
 
 static volatile uint32_t sSystemTickMs;
 
@@ -51,13 +40,6 @@ static float relative_yaw(float raw_yaw, float zero_yaw)
 {
     float yaw = raw_yaw - zero_yaw;
 
-    while (yaw > 180.0f) yaw -= 360.0f;
-    while (yaw < -180.0f) yaw += 360.0f;
-    return yaw;
-}
-
-static float normalize_yaw(float yaw)
-{
     while (yaw > 180.0f) yaw -= 360.0f;
     while (yaw < -180.0f) yaw += 360.0f;
     return yaw;
@@ -161,8 +143,7 @@ static void format_imu_status(char line[17], bool imu_seen)
 
 }
 
-static void show_status(bool straight_running, bool line_tracking,
-                        SpeedControlFault_t speed_fault)
+static void show_status(bool line_tracking, SpeedControlFault_t speed_fault)
 {
     if (speed_fault == SPEED_CONTROL_FAULT_WHEEL_A_STALL) {
         OLED_ShowString(0, 0, (uint8_t *)"SPD FAULT: A", 8);
@@ -172,12 +153,10 @@ static void show_status(bool straight_running, bool line_tracking,
         OLED_ShowString(0, 0, (uint8_t *)"SPD FAULT: C", 8);
     } else if (speed_fault == SPEED_CONTROL_FAULT_WHEEL_D_STALL) {
         OLED_ShowString(0, 0, (uint8_t *)"SPD FAULT: D", 8);
-    } else if (straight_running) {
-        OLED_ShowString(0, 0, (uint8_t *)"KEY1: GYRO RUN", 8);
     } else if (line_tracking) {
-        OLED_ShowString(0, 0, (uint8_t *)"KEY2: LINE TRACK", 8);
+        OLED_ShowString(0, 0, (uint8_t *)"KEY1: LINE TRACK", 8);
     } else {
-        OLED_ShowString(0, 0, (uint8_t *)"K1 GYRO K2 LINE", 8);
+        OLED_ShowString(0, 0, (uint8_t *)"KEY1: READY     ", 8);
     }
 }
 
@@ -186,16 +165,10 @@ int main(void)
     WIT_Data_t imu_data;
     float yaw = 0.0f;
     float yaw_zero = 0.0f;
-    float key1_yaw = 0.0f;
     uint8_t gray_map;
     bool imu_seen = false;
-    bool straight_running = false;
     bool line_tracking = false;
     bool line_lost = false;
-    bool key1_route_active = false;
-    bool return_leg_started = false;
-    uint32_t last_straight_update_ms = 0U;
-    uint32_t return_straight_start_ms = 0U;
     uint32_t line_lost_start_ms = 0U;
     uint32_t last_line_update_ms = 0U;
     uint32_t last_display_update_ms = 0U;
@@ -213,50 +186,28 @@ int main(void)
     WIT_Init();
 
     OLED_Init();
-    show_status(false, false, SPEED_CONTROL_FAULT_NONE);
+    show_status(false, SPEED_CONTROL_FAULT_NONE);
 
     while (1) {
         uint32_t now = get_system_tick_ms();
 
         if (WIT_GetData(&imu_data)) {
             if (!imu_seen) {
-                /* The vehicle's heading when its first IMU frame arrives is 0. */
+                /* 上电后第一帧陀螺仪偏航角作为小车初始 0 度方向。 */
                 yaw_zero = imu_data.yaw;
                 imu_seen = true;
             }
             yaw = relative_yaw(imu_data.yaw, yaw_zero);
         }
 
-        if (!straight_running && !line_tracking && imu_seen && KEY1_PRESSED) {
-            now = get_system_tick_ms();
-            key1_yaw = yaw;
-            Straight_Config(STRAIGHT_KP, STRAIGHT_KI, STRAIGHT_KD,
-                            STRAIGHT_BASE_SPEED);
-            Straight_Start(yaw, now);
-            Straight_Update(yaw, now);
-            last_straight_update_ms = now;
-            straight_running = true;
-            key1_route_active = true;
-            return_leg_started = false;
-            show_status(true, false, SPEED_CONTROL_FAULT_NONE);
-        }
-
-        if (!straight_running && !line_tracking && KEY2_PRESSED) {
+        if (!line_tracking && KEY1_PRESSED) {
             now = get_system_tick_ms();
             Line_Config(LINE_KP, LINE_KI, LINE_KD, LINE_BASE_SPEED);
             Line_Start(now);
             last_line_update_ms = now;
             line_lost = false;
             line_tracking = true;
-            key1_route_active = false;
-            return_leg_started = false;
-            show_status(false, true, SPEED_CONTROL_FAULT_NONE);
-        }
-
-        if (straight_running &&
-            (now - last_straight_update_ms) >= STRAIGHT_CONTROL_PERIOD_MS) {
-            last_straight_update_ms = now;
-            Straight_Update(yaw, now);
+            show_status(true, SPEED_CONTROL_FAULT_NONE);
         }
 
         if (line_tracking &&
@@ -276,62 +227,20 @@ int main(void)
             Line_Update(gray_map, now);
         }
 
-        if (straight_running && (gray_map = Gray_ReadAll()) != 0U) {
-            /* A black line starts the same tracking path used by KEY2. */
-            Straight_Stop();
-            Line_Config(LINE_KP, LINE_KI, LINE_KD, LINE_BASE_SPEED);
-            Line_Start(now);
-            Line_Update(gray_map, now);
-            straight_running = false;
-            line_lost = false;
-            last_line_update_ms = now;
-            line_tracking = true;
-            show_status(false, true, SPEED_CONTROL_FAULT_NONE);
-        }
-
-        if (straight_running && return_leg_started &&
-            (now - return_straight_start_ms) >= RETURN_STRAIGHT_DURATION_MS) {
-            Straight_Stop();
-            straight_running = false;
-            key1_route_active = false;
-            return_leg_started = false;
-            show_status(false, false, SPEED_CONTROL_FAULT_NONE);
-        }
-
         if (line_tracking && line_lost &&
             (now - line_lost_start_ms) >= LINE_LOST_STOP_MS) {
-            if (key1_route_active && !return_leg_started) {
-                now = get_system_tick_ms();
-                Straight_Config(STRAIGHT_KP, STRAIGHT_KI, STRAIGHT_KD,
-                                STRAIGHT_BASE_SPEED);
-                Straight_StartToYaw(normalize_yaw(key1_yaw + 180.0f), now);
-                Straight_Update(yaw, now);
-                last_straight_update_ms = now;
-                return_straight_start_ms = now;
-                straight_running = true;
-                line_tracking = false;
-                line_lost = false;
-                return_leg_started = true;
-                show_status(true, false, SPEED_CONTROL_FAULT_NONE);
-            } else {
-                Line_Stop();
-                line_tracking = false;
-                line_lost = false;
-                key1_route_active = false;
-                return_leg_started = false;
-                show_status(false, false, SPEED_CONTROL_FAULT_NONE);
-            }
-        }
-
-        if ((straight_running || line_tracking) &&
-            SpeedControl_Update(now) &&
-            SpeedControl_GetFault() != SPEED_CONTROL_FAULT_NONE) {
-            straight_running = false;
+            Line_Stop();
             line_tracking = false;
             line_lost = false;
-            key1_route_active = false;
-            return_leg_started = false;
-            show_status(false, false, SpeedControl_GetFault());
+            show_status(false, SPEED_CONTROL_FAULT_NONE);
+        }
+
+        if (line_tracking &&
+            SpeedControl_Update(now) &&
+            SpeedControl_GetFault() != SPEED_CONTROL_FAULT_NONE) {
+            line_tracking = false;
+            line_lost = false;
+            show_status(false, SpeedControl_GetFault());
         }
 
         if ((now - last_display_update_ms) >= SENSOR_DISPLAY_PERIOD_MS) {
@@ -340,10 +249,10 @@ int main(void)
 
             format_yaw(yaw_line, yaw, imu_seen);
             format_gray(gray_line, gray_map);
-            format_imu_status(imu_line, imu_seen);
 
             OLED_ShowString(0, 2, (uint8_t *)yaw_line, 8);
             OLED_ShowString(0, 4, (uint8_t *)gray_line, 8);
+            format_imu_status(imu_line, imu_seen);
             OLED_ShowString(0, 6, (uint8_t *)imu_line, 8);
         }
     }
