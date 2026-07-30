@@ -15,20 +15,22 @@
 #include "speed_control.h"
 #include "wit.h"
 
-#define SENSOR_DISPLAY_PERIOD_MS  50U  /* OLED 与传感器状态刷新周期。 */
+#define SENSOR_DISPLAY_PERIOD_MS  100U  /* OLED 与传感器状态刷新周期。 */
 #define SYSTICK_PERIOD_MS         1U   /* 系统 SysTick 的计时单位。 */
  
 #define LINE_CONTROL_PERIOD_MS      5U      /* 循迹 PID 更新周期。 */
 #define LINE_LOST_STOP_MS           300U   /* 连续丢失黑线后停车的确认时间。 */
-#define LINE_KP                     600.0f /* 循迹 PID 比例系数。 */
+#define LINE_KP                     250.0f /* 循迹 PID 比例系数。 */
 #define LINE_KI                      0.0f   /* 循迹 PID 积分系数。 */
-#define LINE_KD                      8.0f   /* 循迹 PID 微分系数。 */
-#define LINE_BASE_SPEED             900    /* 循迹基础 PWM，数值越小速度越快。 */
+#define LINE_KD                      3.0f   /* 循迹 PID 微分系数。 */
+#define LINE_BASE_SPEED             1200   /* 循迹基础 PWM，数值越小速度越快。 */
 #define YAW_STOP_DEGREES             360.0f  /* 累计转过一圈后停车。 */
+#define KEY1_STOP_LINE_ENABLE_MS   16000U  /* KEY1 到此时间后允许停车基准线生效。 */
+#define KEY1_STOP_LINE_BLACK_COUNT     5    /* 停车基准线的最少黑线传感器数量。 */
 
 #define KEY2_TURN_ENABLE_MS            500U /* 起步后此时间内不判定进入半圆。 */
-#define KEY2_TURN_CONFIRM_MS           150U /* 角速度连续超限确认时间。 */
-#define KEY2_TURN_RATE_DPS             30.0f /* 半圆入口角速度阈值，单位 °/s。 */
+#define KEY2_TURN_CONFIRM_MS           50U /* 角速度连续超限确认时间。 */
+#define KEY2_TURN_RATE_DPS             20.0f /* 半圆入口角速度阈值，单位 °/s。 */
 #define JY901S_GYRO_RANGE_DPS       2000.0f /* JY901S 陀螺仪量程为 ±2000 °/s。 */
 
 static volatile uint32_t sSystemTickMs;
@@ -192,6 +194,8 @@ int main(void)
     bool line_lost = false;
     bool imu_seen = false;
     bool yaw_sample_valid = false;
+    bool key1_stop_line_detected = false;
+    bool key1_stop_line_enabled = false;
     bool turn_detecting = false;
     uint32_t line_lost_start_ms = 0U;
     uint32_t run_start_ms = 0U;
@@ -255,6 +259,8 @@ int main(void)
             yaw_sample_valid = imu_seen;
             last_yaw = latest_yaw;
             accumulated_yaw_degrees = 0.0f;
+            key1_stop_line_detected = false;
+            key1_stop_line_enabled = false;
             line_tracking = true;
             format_elapsed_time(time_line, 0U);
             OLED_ShowString(0, 2, (uint8_t *)time_line, 8);
@@ -270,11 +276,11 @@ int main(void)
                 run_start_ms = now;
                 frozen_elapsed_ms = 0U;
                 turn_detecting = false;
-            turn_detect_ms = 0U;
-            key2_tracking = true;
-            format_elapsed_time(time_line, 0U);
-            OLED_ShowString(0, 2, (uint8_t *)time_line, 8);
-            show_status(false, true, imu_seen, SPEED_CONTROL_FAULT_NONE);
+                turn_detect_ms = 0U;
+                key2_tracking = true;
+                format_elapsed_time(time_line, 0U);
+                OLED_ShowString(0, 2, (uint8_t *)time_line, 8);
+                show_status(false, true, imu_seen, SPEED_CONTROL_FAULT_NONE);
             } else {
                 show_status(false, false, false, SPEED_CONTROL_FAULT_NONE);
             }
@@ -284,6 +290,11 @@ int main(void)
             (now - last_line_update_ms) >= LINE_CONTROL_PERIOD_MS) {
             last_line_update_ms = now;
             gray_map = Gray_ReadAll();
+
+            if (line_tracking && key1_stop_line_enabled &&
+                Gray_BlackCount(gray_map) >= KEY1_STOP_LINE_BLACK_COUNT) {
+                key1_stop_line_detected = true;
+            }
 
             if (line_tracking && gray_map == 0U) {
                 if (!line_lost) {
@@ -295,6 +306,20 @@ int main(void)
             }
 
             Line_Update(gray_map, now);
+        }
+
+        if (line_tracking && !key1_stop_line_enabled &&
+            (now - run_start_ms) >= KEY1_STOP_LINE_ENABLE_MS) {
+            key1_stop_line_enabled = true;
+        }
+
+        if (line_tracking && key1_stop_line_detected) {
+            Line_Stop();
+            frozen_elapsed_ms = now - run_start_ms;
+            line_tracking = false;
+            line_lost = false;
+            key1_stop_line_detected = false;
+            show_status(false, false, imu_seen, SPEED_CONTROL_FAULT_NONE);
         }
 
         if (line_tracking && line_lost &&

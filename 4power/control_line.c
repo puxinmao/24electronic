@@ -16,8 +16,8 @@
 #define LINE_EDGE_ERROR           2.5f /* 误差达到此值视为压到边缘，强制使用较强转向 */
 
 //=========更主要的===============
-#define LINE_CORR_LIMIT         620.0f /* 最大左右差速修正；大误差时 PID 输出会被限制在此处 */
-#define LINE_EDGE_MIN_CORR       400.0f /* 边缘状态的最小转向修正；增大可加强急弯纠偏 */
+#define LINE_CORR_LIMIT         400.0f /* 最大左右差速修正；大误差时 PID 输出会被限制在此处 */
+#define LINE_EDGE_MIN_CORR       150.0f /* 边缘状态的最小转向修正；增大可加强急弯纠偏 */
 #define LINE_CURVE_PWM_PER_ERROR  80.0f /* 每 1.0 位置误差增加的减速 PWM；越大弯中越慢 */
 #define LINE_CURVE_PWM_OFFSET    280   /* 弯道减速 PWM 的最大增量；越大急弯整体越慢 */
 
