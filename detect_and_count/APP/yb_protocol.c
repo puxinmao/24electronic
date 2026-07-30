@@ -5,6 +5,9 @@
 #include "string.h"
 #include "usart.h"
 
+/* 临时诊断：直接打印 K230 发来的完整原始 ASCII 帧，验证坐标是否在 K230 端已变小。 */
+#define K230_RAW_FRAME_DEBUG       (1)
+
 
 uint8_t RxBuffer[PTO_BUF_LEN_MAX];
 /* 接收数据下标 */
@@ -102,6 +105,18 @@ void Pto_Data_Parse(uint8_t *data_buf, uint8_t num)
 {
     uint8_t pto_head = data_buf[0];
     uint8_t pto_tail = data_buf[num - 1];
+
+    /*
+     * 重要：此处打印的是尚未解析、尚未缩放的 K230 原始帧。
+     * 若这里的 cx 仍只有 -1/0/1，问题在 K230 的坐标/ROI/发送代码，TI 不会改变它。
+     */
+#if K230_RAW_FRAME_DEBUG
+    uart0_send_string("K230 RAW: ");
+    for (uint8_t raw_i = 0U; raw_i < num; raw_i++) {
+        uart0_send_char(data_buf[raw_i]);
+    }
+    uart0_send_string("\r\n");
+#endif
 
     /* 帧头帧尾校验 */
     if (!(pto_head == PTO_HEAD && pto_tail == PTO_TAIL))

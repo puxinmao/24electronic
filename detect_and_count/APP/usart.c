@@ -1,170 +1,172 @@
 #include "usart.h"
 #include "yb_protocol.h"
 
+#define UART1_RX_BUFFER_SIZE    (32)
+
+/* UART3 的 CAN-TTL 回包缓存；主循环用于等待张大头命令确认帧。 */
+static volatile uint8_t s_uart1_rx_buffer[UART1_RX_BUFFER_SIZE];
+static volatile uint8_t s_uart1_rx_head = 0;
+static volatile uint8_t s_uart1_rx_tail = 0;
 
 void uart0_init(void)
 {
-	//清除串口中断标志
-	//Clear the serial port interrupt flag
-	NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
-	//使能串口中断
-	//Enable serial port interrupt
-	NVIC_EnableIRQ(UART_0_INST_INT_IRQN);
+    NVIC_ClearPendingIRQ(UART_0_INST_INT_IRQN);
+    NVIC_EnableIRQ(UART_0_INST_INT_IRQN);
 }
 
-//串口发送一个字节
-//The serial port sends a byte
 void uart0_send_char(unsigned char data)
 {
-	//当串口0忙的时候等待
-	//Wait when serial port 0 is busy
-	while( DL_UART_isBusy(UART_0_INST) == true );
-	//发送
-	//send
-	DL_UART_Main_transmitData(UART_0_INST, data);
+    while (DL_UART_isBusy(UART_0_INST) == true) { }
+    DL_UART_Main_transmitData(UART_0_INST, data);
 }
 
-//串口发送字符串 Send string via serial port
-void uart0_send_string(char* str)
+void uart0_send_string(char *str)
 {
-    //当前字符串地址不在结尾 并且 字符串首地址不为空
-		// The current string address is not at the end and the string first address is not empty
-    while(*str!=0&&str!=0)
+    while ((str != 0) && (*str != 0))
     {
-        //发送字符串首地址中的字符，并且在发送完成之后首地址自增
-		// Send the characters in the first address of the string, and increment the first address after sending.
-        uart0_send_char(*str++);
+        uart0_send_char((unsigned char)*str++);
     }
 }
 
 #if !defined(__MICROLIB)
-//不使用微库的话就需要添加下面的函数
-//If you don't use the micro library, you need to add the following function
 #if (__ARMCLIB_VERSION <= 6000000)
-//如果编译器是AC5  就定义下面这个结构体
-//If the compiler is AC5, define the following structure
 struct __FILE
 {
-	int handle;
+    int handle;
 };
 #endif
 
 FILE __stdout;
 
-//定义_sys_exit()以避免使用半主机模式
-//Define _sys_exit() to avoid using semihosting mode
 void _sys_exit(int x)
 {
-	x = x;
+    (void)x;
 }
 #endif
 
-
-//printf函数重定义
-//printf function redefinition
 int fputc(int ch, register FILE *stream)
 {
-	//当串口0忙的时候等待，不忙的时候再发送传进来的字符
-	//Wait when serial port 0 is busy, and send the incoming characters when it is not busy
-	while( DL_UART_isBusy(UART_0_INST) == true );
-	
-	DL_UART_Main_transmitData(UART_0_INST, ch);
-	
-	return ch;
+    (void)stream;
+    uart0_send_char((unsigned char)ch);
+    return ch;
 }
 
-//串口的中断服务函数
-//Serial port interrupt service function
 void UART_0_INST_IRQHandler(void)
 {
-	uint8_t receivedData = 0;
-	
-	//如果产生了串口中断
-	//If a serial port interrupt occurs
-	switch( DL_UART_getPendingInterrupt(UART_0_INST) )
-	{
-		case DL_UART_IIDX_RX://如果是接收中断	If it is a receive interrupt
-			
-			// 接收发送过来的数据保存	Receive and save the data sent
-			receivedData = DL_UART_Main_receiveData(UART_0_INST);
-		
-			// 将保存的数据再发送出去 Send the saved data again
-            uart0_send_char(receivedData);
-		
-			break;
-		
-		default://其他的串口中断	Other serial port interrupts
-			break;
-	}
-}
+    uint8_t received_data;
 
-
-///////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////
-///////////////////////////////////////////////////////////////////////////////////
-
-
-
-void uart2_init(void)
-{
-	//清除串口中断标志
-	//Clear the serial port interrupt flag
-	NVIC_ClearPendingIRQ(UART_2_INST_INT_IRQN);
-	//使能串口中断
-	//Enable serial port interrupt
-	NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
-}
-
-//串口发送一个字节
-//The serial port sends a byte
-void uart2_send_char(unsigned char data)
-{
-	//当串口0忙的时候等待
-	//Wait when serial port 0 is busy
-	while( DL_UART_isBusy(UART_2_INST) == true );
-	//发送
-	//send
-	DL_UART_Main_transmitData(UART_2_INST, data);
-}
-
-//串口发送字符串 Send string via serial port
-void uart2_send_string(char* str)
-{
-    //当前字符串地址不在结尾 并且 字符串首地址不为空
-		// The current string address is not at the end and the string first address is not empty
-    while(*str!=0&&str!=0)
+    switch (DL_UART_getPendingInterrupt(UART_0_INST))
     {
-        //发送字符串首地址中的字符，并且在发送完成之后首地址自增
-		// Send the characters in the first address of the string, and increment the first address after sending.
-        uart2_send_char(*str++);
+        case DL_UART_IIDX_RX:
+            received_data = DL_UART_Main_receiveData(UART_0_INST);
+            uart0_send_char(received_data);
+            break;
+        default:
+            break;
     }
 }
 
-
-//串口的中断服务函数
-//Serial port interrupt service function
-void UART_2_INST_IRQHandler(void)
+/* -------------------------------------------------------------------------- */
+/* UART3: PB2=TX, PB3=RX，连接张大头 CAN-TTL 模块                              */
+/* -------------------------------------------------------------------------- */
+void uart1_init(void)
 {
-	uint8_t received = 0;
-	
-	//如果产生了串口中断
-	//If a serial port interrupt occurs
-	switch( DL_UART_getPendingInterrupt(UART_2_INST) )
-	{
-		case DL_UART_IIDX_RX://如果是接收中断	If it is a receive interrupt
-			
-			// 接收发送过来的数据保存	Receive and save the data sent
-			received = DL_UART_Main_receiveData(UART_2_INST);
-            // uart0_send_char(received);
-            Pto_Data_Receive(received);
-			
-			break;
-		
-		default://其他的串口中断	Other serial port interrupts
-			break;
-	}
+    s_uart1_rx_head = 0;
+    s_uart1_rx_tail = 0;
+    NVIC_ClearPendingIRQ(UART_1_INST_INT_IRQN);
+    NVIC_EnableIRQ(UART_1_INST_INT_IRQN);
 }
 
+void uart1_send_char(uint8_t data)
+{
+    while (DL_UART_isBusy(UART_1_INST) == true) { }
+    DL_UART_Main_transmitData(UART_1_INST, data);
+}
 
+void uart1_send_bytes(const uint8_t *data, uint8_t length)
+{
+    uint8_t i;
 
+    if (data == 0) {
+        return;
+    }
 
+    for (i = 0; i < length; i++)
+    {
+        uart1_send_char(data[i]);
+    }
+}
+
+void uart1_clear_rx(void)
+{
+    s_uart1_rx_tail = s_uart1_rx_head;
+}
+
+uint8_t uart1_read_byte(uint8_t *data)
+{
+    if ((data == 0) || (s_uart1_rx_tail == s_uart1_rx_head)) {
+        return 0;
+    }
+
+    *data = s_uart1_rx_buffer[s_uart1_rx_tail];
+    s_uart1_rx_tail = (uint8_t)((s_uart1_rx_tail + 1U) % UART1_RX_BUFFER_SIZE);
+    return 1;
+}
+
+void UART_1_INST_IRQHandler(void)
+{
+    uint8_t received_data;
+    uint8_t next_head;
+
+    switch (DL_UART_getPendingInterrupt(UART_1_INST))
+    {
+        case DL_UART_IIDX_RX:
+            received_data = DL_UART_Main_receiveData(UART_1_INST);
+            next_head = (uint8_t)((s_uart1_rx_head + 1U) % UART1_RX_BUFFER_SIZE);
+            if (next_head != s_uart1_rx_tail) {
+                s_uart1_rx_buffer[s_uart1_rx_head] = received_data;
+                s_uart1_rx_head = next_head;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* UART1: PA8=TX, PA9=RX，接收 K230 检测数据                                  */
+/* -------------------------------------------------------------------------- */
+void uart2_init(void)
+{
+    NVIC_ClearPendingIRQ(UART_2_INST_INT_IRQN);
+    NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
+}
+
+void uart2_send_char(unsigned char data)
+{
+    while (DL_UART_isBusy(UART_2_INST) == true) { }
+    DL_UART_Main_transmitData(UART_2_INST, data);
+}
+
+void uart2_send_string(char *str)
+{
+    while ((str != 0) && (*str != 0))
+    {
+        uart2_send_char((unsigned char)*str++);
+    }
+}
+
+void UART_2_INST_IRQHandler(void)
+{
+    uint8_t received_data;
+
+    switch (DL_UART_getPendingInterrupt(UART_2_INST))
+    {
+        case DL_UART_IIDX_RX:
+            received_data = DL_UART_Main_receiveData(UART_2_INST);
+            Pto_Data_Receive(received_data);
+            break;
+        default:
+            break;
+    }
+}

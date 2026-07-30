@@ -15,10 +15,13 @@
  */
 const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
 const GPIO1  = GPIO.addInstance();
+const MCAN   = scripting.addModule("/ti/driverlib/MCAN", {}, false);
+const MCAN1  = MCAN.addInstance();
 const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
 const UART   = scripting.addModule("/ti/driverlib/UART", {}, false);
 const UART1  = UART.addInstance();
 const UART2  = UART.addInstance();
+const UART3  = UART.addInstance();
 
 /**
  * Write custom configuration values to the imported modules.
@@ -26,13 +29,33 @@ const UART2  = UART.addInstance();
 const gate7  = system.clockTree["MFCLKGATE"];
 gate7.enable = true;
 
+/* CANFD0 needs a supported CAN clock. The LP_MSPM0G3507 HFXT is 40 MHz,
+ * and SysConfig derives the 48 MHz HFCLK used by MCAN. */
+const mux4       = system.clockTree["EXHFMUX"];
+mux4.inputSelect = "EXHFMUX_XTAL";
+
+const pinFunction3     = system.clockTree["HFCLKEXT"];
+pinFunction3.inputFreq = 40;
+
+const pinFunction4                       = system.clockTree["HFXT"];
+pinFunction4.enable                      = true;
+pinFunction4.HFXTStartup                 = 10;
+pinFunction4.HFCLKMonitor                = true;
+pinFunction4.inputFreq                   = 40;
+pinFunction4.peripheral.hfxInPin.$assign = "PA5";
+
 GPIO1.$name                         = "LED1";
-GPIO1.port                          = "PORTB";
 GPIO1.associatedPins[0].$name       = "PIN_2";
 GPIO1.associatedPins[0].assignedPin = "2";
 
 const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
 
+SYSCTL.CANCLKSource          = "HFCLK";
+SYSCTL.useHFCLK_Manual       = true;
+SYSCTL.HFCLKSource           = "HFXT";
+SYSCTL.HFCLK_Freq            = 48000000;
+SYSCTL.HFCLKMonitor          = true;
+SYSCTL.HFXTStartup           = 10;
 SYSCTL.forceDefaultClkConfig = true;
 SYSCTL.clockTreeEn           = true;
 
@@ -61,12 +84,59 @@ UART2.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
 UART2.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
 UART2.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
 
+UART3.$name                    = "UART_1";
+UART3.targetBaudRate           = 115200;
+UART3.enabledInterrupts        = ["RX"];
+UART3.peripheral.$assign       = "UART3";
+UART3.peripheral.rxPin.$assign = "PB3";
+UART3.peripheral.txPin.$assign = "PB2";
+UART3.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric4";
+UART3.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric5";
+
+
+/* Direct CAN connection: MSPM0G3507 PA12/PA13 -> SN65HVD230 -> motor CANH/CANL.
+ * The motor is configured to CAN1_MAP and uses classic CAN at 500 kbps. */
+MCAN1.$name                    = "MCAN0";
+MCAN1.wkupReqEnable            = true;
+MCAN1.autoWkupEnable           = true;
+MCAN1.emulationEnable          = true;
+MCAN1.tdcEnable                = true;
+MCAN1.additionalCoreConfig     = true;
+MCAN1.rrfe                     = true;
+MCAN1.rrfs                     = true;
+MCAN1.anfe                     = "1";
+MCAN1.anfs                     = "1";
+MCAN1.txEventFIFOWaterMark     = 0;
+MCAN1.overrideRetention        = true;
+MCAN1.desiredNomRate           = 500;
+MCAN1.stdFiltType              = "01";
+MCAN1.flesa                    = 0;
+MCAN1.lse                      = 0;
+MCAN1.desiredDataRate          = 2;
+MCAN1.rxFIFO1waterMark         = 0;
+MCAN1.rxFIFO0waterMark         = 0;
+MCAN1.lss                      = 0;
+MCAN1.rxFIFO0startAddr         = 0;
+MCAN1.rxFIFO1startAddr         = 0;
+MCAN1.rxBufStartAddr           = 0;
+MCAN1.rxFIFO1size              = 0;
+MCAN1.rxFIFO0size              = 0;
+MCAN1.txStartAddr              = 0;
+MCAN1.txBufNum                 = 1;
+MCAN1.txEventFIFOStartAddr     = 0;
+MCAN1.peripheral.$assign       = "CANFD0";
+MCAN1.peripheral.rxPin.$assign = "PA13";
+MCAN1.peripheral.txPin.$assign = "PA12";
+/* Use unique SysConfig GPIO instance names; UART0 already owns Generic0/1. */
+MCAN1.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric6";
+MCAN1.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric7";
+
 /**
  * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
  * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
  * re-solve from scratch.
  */
-GPIO1.associatedPins[0].pin.$suggestSolution = "PB2";
+GPIO1.associatedPins[0].pin.$suggestSolution = "PA2";
 Board.peripheral.$suggestSolution            = "DEBUGSS";
 Board.peripheral.swclkPin.$suggestSolution   = "PA20";
 Board.peripheral.swdioPin.$suggestSolution   = "PA19";

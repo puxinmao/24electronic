@@ -19,8 +19,8 @@
 
 /* 单个钢球信息 */
 typedef struct {
-    int cx;    /* 中心 X（模型坐标 320×320） */
-    int cy;    /* 中心 Y */
+    int cx;    /* K230 原始帧中收到的中心 X；TI 不对它做缩放 */
+    int cy;    /* K230 原始帧中收到的中心 Y；TI 不对它做缩放 */
     int w;     /* 宽度 */
     int h;     /* 高度 */
 } BallInfo;
