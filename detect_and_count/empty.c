@@ -28,16 +28,22 @@
 /* 自动轨迹：O(0 cm) -> +5 cm -> -5 cm，最终稳定在 -5 cm 附近。 */
 #define TRAJECTORY_ORIGIN_POSITION          (0)
 #define TRAJECTORY_PLUS_POSITION          (500)  /* +5.00 cm */
+#define TRAJECTORY_MINUS_POSITION        (-500)  /* -5.00 cm */
 #define TRAJECTORY_START_TOLERANCE         (30)  /* Start only from O +/- 0.30 cm. */
 #define TRAJECTORY_TARGET_TOLERANCE        (50)  /* Stop target within +/- 0.50 cm. */
-#define TRAJECTORY_APPROACH_ZONE          (120)  /* Brake during final 1.20 cm. */
-#define TRAJECTORY_APPROACH_PULSE_MS       (20)
+#define TRAJECTORY_REFERENCE_STEP           (50)  /* Move the setpoint by 0.50 cm at a time. */
+#define TRAJECTORY_REFERENCE_TOLERANCE      (15)  /* Advance after tracking within 0.15 cm. */
+#define TRAJECTORY_REFERENCE_CONFIRM_FRAMES  (2)
+#define TRAJECTORY_APPROACH_ZONE          (200)  /* Begin braking from +/-3 cm. */
+#define TRAJECTORY_APPROACH_PULSE_MS       (12)
+#define TRAJECTORY_APPROACH_SPEED_RPM       (5)
 #define CENTER_CAPTURE_ZONE                (80)  /* Fine control inside 0.80 cm. */
 #define CENTER_CAPTURE_PULSE_MS            (12)
 #define CENTER_CAPTURE_SPEED_RPM            (5)
 #define TRAJECTORY_START_CONFIRM_FRAMES      (3)
 #define TRAJECTORY_FINAL_CONFIRM_FRAMES      (5)
-#define TRAJECTORY_TIMEOUT_MS             (4800)
+#define TRAJECTORY_SETTLE_DELTA              (8)  /* <= 0.08 cm between frames. */
+#define TRAJECTORY_BUTTON_DEBOUNCE_MS       (30)
 /*
  * 参考轨迹采用“限速 + 跟随窗口”而非直接跳变：
  * - 每个新视觉帧设定值最多前进 0.12 cm；
@@ -61,6 +67,8 @@
 #define PID_INTEGRAL_LIMIT              (3000) /* Limits I contribution to 0.90 command. */
 #define PID_OUTPUT_LIMIT                (1250)
 #define PID_OUTPUT_MIN                    (30)  /* Start correcting from 0.30 command. */
+#define TRAJECTORY_OUTPUT_MIN              (1)  /* Allow 0.50 cm reference steps to move. */
+#define TRAJECTORY_COMMAND_MIN             (30)  /* Minimum drive for one reference step. */
 
 /* Emm_V5 / ZDT_X CAN1_MAP 参数；须与电机内部设置相同。 */
 #define MOTOR_ID                           (1)
@@ -108,16 +116,19 @@ typedef struct {
 typedef enum {
     TRAJECTORY_WAIT_AT_ORIGIN = 0,
     TRAJECTORY_MOVE_TO_PLUS,
-    TRAJECTORY_MOVE_TO_ORIGIN,
-    TRAJECTORY_HOLD_AT_ORIGIN,
-    TRAJECTORY_DONE,
-    TRAJECTORY_TIMEOUT
+    TRAJECTORY_MOVE_TO_MINUS,
+    TRAJECTORY_HOLD_AT_MINUS,
+    TRAJECTORY_DONE
 } TrajectoryState;
 
 typedef struct {
     TrajectoryState state;
     uint16_t elapsed_ms;
     uint8_t confirm_frames;
+    int reference_position;
+    uint8_t reference_confirm_frames;
+    int previous_position;
+    uint8_t position_valid;
 } TrajectoryController;
 
 
@@ -133,7 +144,13 @@ static uint8_t g_pending_direction = MOTOR_DIRECTION_RAISE;
 static uint16_t g_pending_speed_rpm = 0U;
 static uint16_t g_pending_pulse_ms = 0U;
 static BallPidController g_pid = {0};
-static TrajectoryController g_trajectory = { TRAJECTORY_WAIT_AT_ORIGIN, 0U, 0U };
+static uint8_t g_button_was_pressed = 0U;
+static uint16_t g_button_debounce_ms = 0U;
+static TrajectoryController g_trajectory = {
+    TRAJECTORY_WAIT_AT_ORIGIN, 0U, 0U, 0, 0U, 0, 0U
+};
+
+static uint8_t task_trajectory_is_active(void);
 
 static int clamp_int(int value, int min_value, int max_value)
 {
@@ -236,7 +253,16 @@ static int ball_pid_update(int raw_position, int target_position)
     }
     g_pid.previous_error = error;
 
-    if (abs_int(command) < PID_OUTPUT_MIN) {
+    if ((task_trajectory_is_active() != 0U) &&
+        (abs_int(error) > TRAJECTORY_REFERENCE_TOLERANCE) &&
+        (abs_int(command) < TRAJECTORY_COMMAND_MIN)) {
+        command = (error > 0) ?
+            TRAJECTORY_COMMAND_MIN : -TRAJECTORY_COMMAND_MIN;
+    }
+
+    if (abs_int(command) <
+        ((task_trajectory_is_active() != 0U) ?
+         TRAJECTORY_OUTPUT_MIN : PID_OUTPUT_MIN)) {
         command = 0;
     }
     return command;
@@ -260,6 +286,20 @@ static uint16_t calculate_speed_rpm(int effort, int abs_error)
         (PID_OUTPUT_LIMIT - PID_OUTPUT_MIN);
     return (uint16_t)clamp_int(full_speed, MOTOR_MIN_SPEED_RPM,
                                MOTOR_MAX_SPEED_RPM);
+}
+
+static uint16_t calculate_tracking_speed_rpm(int effort, int abs_error)
+{
+    uint16_t speed_rpm = calculate_speed_rpm(effort, abs_error);
+
+    if ((task_trajectory_is_active() != 0U) &&
+        (abs_error <= TRAJECTORY_APPROACH_ZONE)) {
+        return TRAJECTORY_APPROACH_SPEED_RPM;
+    }
+    if (abs_error <= CENTER_CAPTURE_ZONE) {
+        return CENTER_CAPTURE_SPEED_RPM;
+    }
+    return speed_rpm;
 }
 
 static uint16_t calculate_pulse_ms(int effort, int abs_error)
@@ -444,35 +484,81 @@ static void motor_control_tick_1ms(void)
 
 static int task_trajectory_target_position(void)
 {
+    return g_trajectory.reference_position;
+}
+
+static void task_trajectory_advance_reference(int position)
+{
+    int destination;
+    int difference;
+
     if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
-        return TRAJECTORY_PLUS_POSITION;
+        destination = TRAJECTORY_PLUS_POSITION;
+    } else if (g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) {
+        destination = TRAJECTORY_MINUS_POSITION;
+    } else {
+        return;
     }
-    if ((g_trajectory.state == TRAJECTORY_MOVE_TO_ORIGIN) ||
-        (g_trajectory.state == TRAJECTORY_HOLD_AT_ORIGIN) ||
-        (g_trajectory.state == TRAJECTORY_DONE)) {
-        return TRAJECTORY_ORIGIN_POSITION;
+
+    if (abs_int(position - g_trajectory.reference_position) >
+        TRAJECTORY_REFERENCE_TOLERANCE) {
+        g_trajectory.reference_confirm_frames = 0U;
+        return;
     }
-    return TRAJECTORY_ORIGIN_POSITION;
+
+    if (g_trajectory.reference_confirm_frames <
+        TRAJECTORY_REFERENCE_CONFIRM_FRAMES) {
+        g_trajectory.reference_confirm_frames++;
+    }
+    if (g_trajectory.reference_confirm_frames <
+        TRAJECTORY_REFERENCE_CONFIRM_FRAMES) {
+        return;
+    }
+
+    g_trajectory.reference_confirm_frames = 0U;
+    difference = destination - g_trajectory.reference_position;
+    if (difference > 0) {
+        g_trajectory.reference_position +=
+            (difference > TRAJECTORY_REFERENCE_STEP) ?
+            TRAJECTORY_REFERENCE_STEP : difference;
+    } else if (difference < 0) {
+        g_trajectory.reference_position -=
+            ((-difference) > TRAJECTORY_REFERENCE_STEP) ?
+            TRAJECTORY_REFERENCE_STEP : (-difference);
+    }
 }
 
 static void task_trajectory_update_on_measurement(int position)
 {
-    int target = task_trajectory_target_position();
+    int destination;
+    int position_delta = 0;
     uint8_t required_frames = TRAJECTORY_FINAL_CONFIRM_FRAMES;
 
-    if ((g_trajectory.state == TRAJECTORY_DONE) ||
-        (g_trajectory.state == TRAJECTORY_TIMEOUT)) {
+    if (g_trajectory.state == TRAJECTORY_DONE) {
         return;
     }
 
-    if (g_trajectory.state == TRAJECTORY_WAIT_AT_ORIGIN) {
-        target = TRAJECTORY_ORIGIN_POSITION;
-        required_frames = TRAJECTORY_START_CONFIRM_FRAMES;
+    if (g_trajectory.position_valid != 0U) {
+        position_delta = position - g_trajectory.previous_position;
+    }
+    g_trajectory.previous_position = position;
+    g_trajectory.position_valid = 1U;
+
+    if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
+        destination = TRAJECTORY_PLUS_POSITION;
+    } else {
+        destination = TRAJECTORY_MINUS_POSITION;
     }
 
-    if (abs_int(position - target) >
-        ((g_trajectory.state == TRAJECTORY_WAIT_AT_ORIGIN) ?
-         TRAJECTORY_START_TOLERANCE : TRAJECTORY_TARGET_TOLERANCE)) {
+    task_trajectory_advance_reference(position);
+    if ((g_trajectory.reference_position != destination) ||
+        (abs_int(position - destination) > TRAJECTORY_TARGET_TOLERANCE)) {
+        g_trajectory.confirm_frames = 0U;
+        return;
+    }
+
+    if ((g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS) &&
+        (abs_int(position_delta) > TRAJECTORY_SETTLE_DELTA)) {
         g_trajectory.confirm_frames = 0U;
         return;
     }
@@ -486,35 +572,63 @@ static void task_trajectory_update_on_measurement(int position)
 
     g_trajectory.confirm_frames = 0U;
     ball_pid_reset();
-    if (g_trajectory.state == TRAJECTORY_WAIT_AT_ORIGIN) {
-        g_trajectory.state = TRAJECTORY_MOVE_TO_PLUS;
-        g_trajectory.elapsed_ms = 0U;
-    } else if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
-        g_trajectory.state = TRAJECTORY_MOVE_TO_ORIGIN;
-    } else if (g_trajectory.state == TRAJECTORY_MOVE_TO_ORIGIN) {
-        g_trajectory.state = TRAJECTORY_HOLD_AT_ORIGIN;
-    } else if (g_trajectory.state == TRAJECTORY_HOLD_AT_ORIGIN) {
+    if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
+        g_trajectory.state = TRAJECTORY_MOVE_TO_MINUS;
+        g_trajectory.reference_position = TRAJECTORY_PLUS_POSITION;
+        g_trajectory.reference_confirm_frames = 0U;
+        g_trajectory.position_valid = 0U;
+    } else if (g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) {
+        g_trajectory.state = TRAJECTORY_HOLD_AT_MINUS;
+        g_trajectory.reference_position = TRAJECTORY_MINUS_POSITION;
+        g_trajectory.confirm_frames = 0U;
+        g_trajectory.position_valid = 0U;
+    } else if (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS) {
         g_trajectory.state = TRAJECTORY_DONE;
     }
 }
 
-static void task_trajectory_tick_1ms(void)
+static uint8_t trajectory_start_button_pressed(void)
 {
-    if ((g_trajectory.state != TRAJECTORY_MOVE_TO_PLUS) &&
-        (g_trajectory.state != TRAJECTORY_MOVE_TO_ORIGIN) &&
-        (g_trajectory.state != TRAJECTORY_HOLD_AT_ORIGIN)) {
-        return;
+    uint8_t pressed = (DL_GPIO_readPins(KEY_PORT, KEY_PIN_0_PIN) == 0U) ?
+        1U : 0U;
+
+    if (g_button_debounce_ms > 0U) {
+        g_button_debounce_ms--;
+        return 0U;
     }
 
-    if (g_trajectory.elapsed_ms < TRAJECTORY_TIMEOUT_MS) {
-        g_trajectory.elapsed_ms++;
+    if ((pressed != 0U) && (g_button_was_pressed == 0U)) {
+        g_button_was_pressed = 1U;
+        g_button_debounce_ms = TRAJECTORY_BUTTON_DEBOUNCE_MS;
+        return 1U;
     }
-    if (g_trajectory.elapsed_ms >= TRAJECTORY_TIMEOUT_MS) {
-        g_trajectory.state = TRAJECTORY_TIMEOUT;
-        ball_pid_reset();
-        motor_cancel_pending_command();
-        motor_stop();
+
+    if (pressed == 0U) {
+        g_button_was_pressed = 0U;
     }
+    return 0U;
+}
+
+static uint8_t task_trajectory_is_active(void)
+{
+    return ((g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) ||
+            (g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) ||
+            (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS)) ? 1U : 0U;
+}
+
+static void task_trajectory_start(void)
+{
+    g_trajectory.state = TRAJECTORY_MOVE_TO_PLUS;
+    g_trajectory.elapsed_ms = 0U;
+    g_trajectory.confirm_frames = 0U;
+    g_trajectory.reference_position = TRAJECTORY_REFERENCE_STEP;
+    g_trajectory.reference_confirm_frames = 0U;
+    g_trajectory.position_valid = 0U;
+    ball_pid_reset();
+    motor_cancel_pending_command();
+    motor_stop();
+    g_motor_pulse_gap_ms_left = 0U;
+    DL_GPIO_setPins(LED1_PORT, LED1_PIN_2_PIN);
 }
 
 static void motor_can_init(void)
@@ -736,7 +850,8 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
             motor_stop();
             g_pending_command_valid = 1U;
             g_pending_direction = direction;
-            g_pending_speed_rpm = calculate_speed_rpm(abs_int(command), abs_error);
+            g_pending_speed_rpm = calculate_tracking_speed_rpm(
+                abs_int(command), abs_error);
             g_pending_pulse_ms = pulse_ms;
             g_motor_pulse_gap_ms_left = MOTOR_DIRECTION_SETTLE_MS;
         } else if (g_motor_pulse_ms_left > pulse_ms) {
@@ -749,15 +864,13 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
     if (g_motor_pulse_gap_ms_left > 0U) {
         g_pending_command_valid = 1U;
         g_pending_direction = direction;
-        g_pending_speed_rpm = calculate_speed_rpm(abs_int(command), abs_error);
+        g_pending_speed_rpm = calculate_tracking_speed_rpm(
+            abs_int(command), abs_error);
         g_pending_pulse_ms = pulse_ms;
         return;
     }
 
-    speed_rpm = calculate_speed_rpm(abs_int(command), abs_error);
-    if (abs_error <= CENTER_CAPTURE_ZONE) {
-        speed_rpm = CENTER_CAPTURE_SPEED_RPM;
-    }
+    speed_rpm = calculate_tracking_speed_rpm(abs_int(command), abs_error);
     if (motor_set_speed(direction, speed_rpm) != 0U) {
         g_motor_state = MOTOR_STATE_RUNNING;
         g_last_direction = direction;
@@ -806,10 +919,26 @@ int main(void)
     motor_can_init();
 
     while (1) {
+        if ((task_trajectory_is_active() == 0U) &&
+            (trajectory_start_button_pressed() != 0U)) {
+            task_trajectory_start();
+        }
+
         ball_state = take_latest_ball(&ball);
         if (ball_state == 1U) {
             vision_silence_ms = 0U;
-            motor_track_ball(&ball, TRAJECTORY_ORIGIN_POSITION);
+            if (task_trajectory_is_active() != 0U) {
+                task_trajectory_update_on_measurement(
+                    ball_x_pixels_to_position(ball.cx));
+            }
+
+            if (g_trajectory.state == TRAJECTORY_DONE) {
+                motor_cancel_pending_command();
+                motor_stop();
+                DL_GPIO_clearPins(LED1_PORT, LED1_PIN_2_PIN);
+            } else {
+                motor_track_ball(&ball, task_trajectory_target_position());
+            }
         } else if (ball_state == 2U) {
             vision_silence_ms = 0U;
             ball_pid_reset();

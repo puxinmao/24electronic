@@ -15,6 +15,7 @@
  */
 const GPIO   = scripting.addModule("/ti/driverlib/GPIO", {}, false);
 const GPIO1  = GPIO.addInstance();
+const GPIO2  = GPIO.addInstance();
 const MCAN   = scripting.addModule("/ti/driverlib/MCAN", {}, false);
 const MCAN1  = MCAN.addInstance();
 const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
@@ -47,6 +48,12 @@ GPIO1.associatedPins[0].$name       = "PIN_2";
 GPIO1.associatedPins[0].assignedPin = "2";
 
 const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
+
+GPIO2.$name                              = "KEY";
+GPIO2.associatedPins[0].$name            = "PIN_0";
+GPIO2.associatedPins[0].direction        = "INPUT";
+GPIO2.associatedPins[0].internalResistor = "PULL_UP";
+GPIO2.associatedPins[0].pin.$assign      = "PB21";
 
 MCAN1.$name                    = "MCAN0";
 MCAN1.wkupReqEnable            = true;
