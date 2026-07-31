@@ -12,6 +12,7 @@ typedef struct {
     uint8_t initialized;
     uint8_t holding_center;
     uint8_t fine_trim_active;
+    float fine_trim_tilt_bias_mdeg;
     BallControllerTelemetry telemetry;
 } CascadeController;
 
@@ -105,6 +106,7 @@ void BallController_Reset(void)
     g_controller.initialized = 0U;
     g_controller.holding_center = 0U;
     g_controller.fine_trim_active = 0U;
+    g_controller.fine_trim_tilt_bias_mdeg = 0.0f;
     g_controller.telemetry.position_centi_cm = 0;
     g_controller.telemetry.predicted_position_centi_cm = 0;
     g_controller.telemetry.filtered_velocity_centi_cm_s = 0;
@@ -219,12 +221,27 @@ BallControlCommand BallController_Update(const BallSample *sample,
         (absolute_float(g_controller.filtered_velocity) >=
          BALL_FINE_TRIM_RELEASE_VELOCITY_CM_S)) {
         g_controller.fine_trim_active = 0U;
+        g_controller.fine_trim_tilt_bias_mdeg = 0.0f;
     }
     if ((g_controller.fine_trim_active == 0U) &&
         (absolute_float(position_cm) <= BALL_FINE_TRIM_ZONE_CM) &&
         (absolute_float(g_controller.filtered_velocity) <=
          BALL_FINE_TRIM_VELOCITY_CM_S)) {
         g_controller.fine_trim_active = 1U;
+        g_controller.fine_trim_tilt_bias_mdeg = 0.0f;
+    }
+    if (g_controller.fine_trim_active != 0U) {
+        if (((position_cm * g_controller.filtered_velocity) < 0.0f) &&
+            (absolute_float(g_controller.filtered_velocity) >=
+             BALL_FINE_TRIM_VELOCITY_CM_S)) {
+            g_controller.fine_trim_tilt_bias_mdeg = 0.0f;
+        } else if (absolute_float(g_controller.filtered_velocity) <=
+                   BALL_FINE_TRIM_VELOCITY_CM_S) {
+            g_controller.fine_trim_tilt_bias_mdeg = clamp_float(
+                g_controller.fine_trim_tilt_bias_mdeg +
+                (BALL_FINE_TRIM_TILT_RAMP_MDEG_PER_S * dt_seconds),
+                0.0f, BALL_FINE_TRIM_TILT_BIAS_MAX_MDEG);
+        }
     }
     fine_trim_direction = (position_cm < 0.0f) ?
         ZDT_PIPE_RAISE : ZDT_PIPE_LOWER;
@@ -320,9 +337,10 @@ BallControlCommand BallController_Update(const BallSample *sample,
         tilt_magnitude = PIPE_TILT_FINE_MIN_MDEG +
             (absolute_float(position_cm) / BALL_FINE_TRIM_ZONE_CM) *
             (PIPE_TILT_FINE_MAX_MDEG - PIPE_TILT_FINE_MIN_MDEG);
+        tilt_magnitude += g_controller.fine_trim_tilt_bias_mdeg;
         tilt_magnitude = clamp_float(tilt_magnitude,
                                      PIPE_TILT_FINE_MIN_MDEG,
-                                     PIPE_TILT_FINE_MAX_MDEG);
+                                     PIPE_TILT_FINE_LIMIT_MDEG);
     } else if (absolute_float(g_controller.filtered_velocity) <=
                BALL_FINE_TRIM_VELOCITY_CM_S) {
         command.direction = fine_trim_direction;

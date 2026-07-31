@@ -108,8 +108,11 @@
 #define ZDT_MOTOR_DYNAMIC_MAX_SPEED_RPM   (10U)
 /* 将电机速度控制转换为受限的管道倾角控制，单位为 0.001 度。 */
 #define PIPE_TILT_DYNAMIC_LIMIT_MDEG      (4000)
-#define PIPE_TILT_FINE_MIN_MDEG            (600)
-#define PIPE_TILT_FINE_MAX_MDEG           (1500)
+#define PIPE_TILT_FINE_MIN_MDEG           (1000)
+#define PIPE_TILT_FINE_MAX_MDEG           (2500)
+#define PIPE_TILT_FINE_LIMIT_MDEG         (3500)
+#define BALL_FINE_TRIM_TILT_RAMP_MDEG_PER_S (1000.0f)
+#define BALL_FINE_TRIM_TILT_BIAS_MAX_MDEG (1800.0f)
 #define PIPE_TILT_RECOVERY_MIN_MDEG       (3000)
 #define PIPE_TILT_RECOVERY_MAX_MDEG       (8000)
 #define PIPE_TILT_ABSOLUTE_LIMIT_MDEG     (9000)
