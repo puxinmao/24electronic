@@ -29,8 +29,6 @@ const UART3  = UART.addInstance();
 const gate7  = system.clockTree["MFCLKGATE"];
 gate7.enable = true;
 
-/* CANFD0 needs a supported CAN clock. The LP_MSPM0G3507 HFXT is 40 MHz,
- * and SysConfig derives the 48 MHz HFCLK used by MCAN. */
 const mux4       = system.clockTree["EXHFMUX"];
 mux4.inputSelect = "EXHFMUX_XTAL";
 
@@ -50,52 +48,6 @@ GPIO1.associatedPins[0].assignedPin = "2";
 
 const Board = scripting.addModule("/ti/driverlib/Board", {}, false);
 
-SYSCTL.CANCLKSource          = "HFCLK";
-SYSCTL.useHFCLK_Manual       = true;
-SYSCTL.HFCLKSource           = "HFXT";
-SYSCTL.HFCLK_Freq            = 48000000;
-SYSCTL.HFCLKMonitor          = true;
-SYSCTL.HFXTStartup           = 10;
-SYSCTL.forceDefaultClkConfig = true;
-SYSCTL.clockTreeEn           = true;
-
-UART1.$name                    = "UART_0";
-UART1.enabledInterrupts        = ["RX"];
-UART1.targetBaudRate           = 115200;
-UART1.uartClkSrc               = "MFCLK";
-UART1.peripheral.$assign       = "UART0";
-UART1.peripheral.rxPin.$assign = "PA11";
-UART1.peripheral.txPin.$assign = "PA10";
-UART1.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric0";
-UART1.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric1";
-
-UART2.$name                            = "UART_2";
-UART2.targetBaudRate                   = 115200;
-UART2.enabledInterrupts                = ["RX"];
-UART2.peripheral.rxPin.$assign         = "PA9";
-UART2.peripheral.txPin.$assign         = "PA8";
-UART2.txPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric2";
-UART2.txPinConfig.direction            = scripting.forceWrite("OUTPUT");
-UART2.txPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART2.txPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART2.txPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-UART2.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric3";
-UART2.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART2.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART2.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-
-UART3.$name                    = "UART_1";
-UART3.targetBaudRate           = 115200;
-UART3.enabledInterrupts        = ["RX"];
-UART3.peripheral.$assign       = "UART3";
-UART3.peripheral.rxPin.$assign = "PB3";
-UART3.peripheral.txPin.$assign = "PB2";
-UART3.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric4";
-UART3.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric5";
-
-
-/* Direct CAN connection: MSPM0G3507 PA12/PA13 -> SN65HVD230 -> motor CANH/CANL.
- * The motor is configured to CAN1_MAP and uses classic CAN at 500 kbps. */
 MCAN1.$name                    = "MCAN0";
 MCAN1.wkupReqEnable            = true;
 MCAN1.autoWkupEnable           = true;
@@ -108,7 +60,6 @@ MCAN1.anfe                     = "1";
 MCAN1.anfs                     = "1";
 MCAN1.txEventFIFOWaterMark     = 0;
 MCAN1.overrideRetention        = true;
-MCAN1.desiredNomRate           = 500;
 MCAN1.stdFiltType              = "01";
 MCAN1.flesa                    = 0;
 MCAN1.lse                      = 0;
@@ -127,17 +78,67 @@ MCAN1.txEventFIFOStartAddr     = 0;
 MCAN1.peripheral.$assign       = "CANFD0";
 MCAN1.peripheral.rxPin.$assign = "PA13";
 MCAN1.peripheral.txPin.$assign = "PA12";
-/* Use unique SysConfig GPIO instance names; UART0 already owns Generic0/1. */
 MCAN1.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric6";
 MCAN1.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric7";
+
+SYSCTL.CANCLKSource          = "HFCLK";
+SYSCTL.useHFCLK_Manual       = true;
+SYSCTL.HFCLKSource           = "HFXT";
+SYSCTL.HFCLK_Freq            = 48000000;
+SYSCTL.HFCLKMonitor          = true;
+SYSCTL.forceDefaultClkConfig = true;
+SYSCTL.clockTreeEn           = true;
+
+UART1.$name                    = "UART_0";
+UART1.enabledInterrupts        = ["RX"];
+UART1.targetBaudRate           = 115200;
+UART1.uartClkSrc               = "MFCLK";
+UART1.peripheral.$assign       = "UART0";
+UART1.peripheral.rxPin.$assign = "PA11";
+UART1.peripheral.txPin.$assign = "PA10";
+UART1.txPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric0";
+UART1.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric1";
+
+UART2.$name                            = "UART_2";
+UART2.targetBaudRate                   = 115200;
+UART2.enabledInterrupts                = ["RX"];
+UART2.peripheral.rxPin.$assign         = "PA9";
+UART2.peripheral.txPin.$assign         = "PA8";
+UART2.txPinConfig.direction            = scripting.forceWrite("OUTPUT");
+UART2.txPinConfig.hideOutputInversion  = scripting.forceWrite(false);
+UART2.txPinConfig.onlyInternalResistor = scripting.forceWrite(false);
+UART2.txPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+UART2.txPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric2";
+UART2.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
+UART2.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
+UART2.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+UART2.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric3";
+
+UART3.$name                            = "UART_1";
+UART3.targetBaudRate                   = 115200;
+UART3.enabledInterrupts                = ["RX"];
+UART3.peripheral.$assign               = "UART3";
+UART3.peripheral.rxPin.$assign         = "PB3";
+UART3.peripheral.txPin.$assign         = "PB2";
+UART3.txPinConfig.direction            = scripting.forceWrite("OUTPUT");
+UART3.txPinConfig.hideOutputInversion  = scripting.forceWrite(false);
+UART3.txPinConfig.onlyInternalResistor = scripting.forceWrite(false);
+UART3.txPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+UART3.txPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric4";
+UART3.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
+UART3.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
+UART3.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
+UART3.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric5";
 
 /**
  * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future
  * version of the tool will not impact the pinmux you originally saw.  These lines can be completely deleted in order to
  * re-solve from scratch.
  */
-GPIO1.associatedPins[0].pin.$suggestSolution = "PA2";
-Board.peripheral.$suggestSolution            = "DEBUGSS";
-Board.peripheral.swclkPin.$suggestSolution   = "PA20";
-Board.peripheral.swdioPin.$suggestSolution   = "PA19";
-UART2.peripheral.$suggestSolution            = "UART1";
+pinFunction4.peripheral.$suggestSolution           = "SYSCTL";
+pinFunction4.peripheral.hfxOutPin.$suggestSolution = "PA6";
+GPIO1.associatedPins[0].pin.$suggestSolution       = "PA2";
+Board.peripheral.$suggestSolution                  = "DEBUGSS";
+Board.peripheral.swclkPin.$suggestSolution         = "PA20";
+Board.peripheral.swdioPin.$suggestSolution         = "PA19";
+UART2.peripheral.$suggestSolution                  = "UART1";

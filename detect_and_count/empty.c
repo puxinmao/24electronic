@@ -1,54 +1,103 @@
 #include "ti_msp_dl_config.h"
-#include "stdio.h"
 #include "stdint.h"
 #include "usart.h"
 #include "yb_protocol.h"
 
 /*
- * K230 发送的钢球中心坐标约定：屏幕中心 = (0, 0)。
- * 当前实测 X 坐标约为 [-160, 160]；方向控制结果限制为 -1、0、1。
- * 为保留灵敏度，速度和脉冲长度仍按原始像素偏差连续计算。
+ * 水管升降平衡控制。
+ *
+ * K230 发送 $BALL,x,y,score，其中 x=0..639。协议层将 x 转为相对中心的
+ * cx=-320..319；本文件再精确映射为 -12.50..+12.50（单位：0.01）。
+ *   x < 0：抬高水管；x > 0：降低水管；x = 0：保持。
+ *
+ * 电机只支持连续转速命令，因此 PID 输出被转换为“低速、短脉冲”动作。
+ * 每一帧新的视觉坐标都会更新一次 PID；一次脉冲不能被新帧延长，只能缩短或刹停，
+ * 以使单次机械位移尽可能小。
  */
-#define K230_X_HALF_RANGE           (160)
-#define K230_X_DEADBAND_PIXELS      (12)    /* 中心 ±12 像素内不动作，抑制检测抖动 */
-#define BALL_X_MIN                 (-1)
-#define BALL_X_MAX                 (1)
-#define BALL_X_DEADBAND            (0)     /* -1~1 控制范围中，只有 x=0 才停止 */
+#define K230_CENTER_X_OFFSET_PIXELS      (0)
+#define K230_LEFT_EDGE_OFFSET_PIXELS   (-320)
+#define K230_RIGHT_EDGE_OFFSET_PIXELS    (319)
+#define BALL_POSITION_SCALE              (100)   /* 100 = 1.00 位置单位 */
+#define BALL_POSITION_LIMIT             (1250)  /* 12.50 * 100 */
+#define BALL_POSITION_DEADBAND             (8)  /* 平衡点 +/-0.08 cm 内不动作（约 2 像素） */
+#define BALL_BRAKE_ZONE                   (90)  /* Base predictive braking zone: 0.90 cm */
+#define BALL_PREDICTIVE_BRAKE_GAIN          (4)  /* Extra braking zone per frame displacement */
+#define BALL_BRAKE_ZONE_MAX              (220)  /* Fast-approach braking limit: 2.20 cm */
+#define BALL_TARGET_SLOW_ZONE            (200)  /* Slow down within 2.00 cm of balance */
+#define BALL_MOTION_THRESHOLD              (4)  /* 0.04 cm/帧以下视为视觉微小抖动 */
+#define BALL_MIN_CONFIDENCE               (35)  /* K230 score: 0..100 */
+
+/* 自动轨迹：O(0 cm) -> +5 cm -> -5 cm，最终稳定在 -5 cm 附近。 */
+#define TRAJECTORY_TEST_ENABLE              (0)
+#define TRAJECTORY_ORIGIN_POSITION          (0)
+#define TRAJECTORY_PLUS_TARGET            (500) /* +5.00 cm */
+#define TRAJECTORY_MINUS_TARGET          (-500) /* -5.00 cm */
+#define TRAJECTORY_START_TOLERANCE          (50) /* O 点启动判定：+/-0.50 cm */
+#define TRAJECTORY_TARGET_TOLERANCE        (100) /* +5/-5 点最大允许误差：+/-1.00 cm */
+#define TRAJECTORY_START_CONFIRM_FRAMES      (3)
+#define TRAJECTORY_TURN_CONFIRM_FRAMES       (3)
+#define TRAJECTORY_FINAL_STABLE_FRAMES      (10)
+#define TRAJECTORY_MAX_TIME_MS            (5000)
+/*
+ * 参考轨迹采用“限速 + 跟随窗口”而非直接跳变：
+ * - 每个新视觉帧设定值最多前进 0.12 cm；
+ * - 设定值最多只允许领先实测小球 0.45 cm。
+ *
+ * 即使相机连续给出相同位置，设定值也会停下来等小球跟上，因而不会在
+ * O -> +5 cm 起步阶段积累一个很大的 PID 误差并把小球直接冲到端部。
+ */
+#define TRAJECTORY_REFERENCE_STEP_PER_FRAME  (12)
+#define TRAJECTORY_REFERENCE_FOLLOW_WINDOW   (45)
 
 /*
- * 张大头 Emm_V5 / ZDT_X 系列通讯参数。
- * 电机屏幕/上位机中应确认：
- *   P_Serial = CAN1_MAP，ID_Addr = MOTOR_ID，Checksum = 0x6B。
+ * 离散 PID（每个有效 K230 帧执行一次；适用于稳定、较高的视觉帧率）。
+ * P、I、D 均为定点分数，避免在 Cortex-M0+ 上使用软件浮点。
+ * 初始值偏保守：先保证不明显过冲，再按下方说明逐步调大 Kp / Kd。
  */
-#define MOTOR_ID                   (1)
-#define MOTOR_CHECKSUM             (0x6B)
-#define MOTOR_DIR_CW               (0x00)
-#define MOTOR_DIR_CCW              (0x01)
-/*
- * 微调参数：F6 是持续转速命令，因此必须配合短脉冲和 FE 停止。
- * 兼顾灵敏度与稳定性：远离中心时速度/脉冲稍大，靠近中心时自动缩短脉冲。
- * 脉冲必须长于闭环驱动器的起步/加速时间；20~45 ms 过短时，电机可能来不及产生可见位移。
- * 若仍有过冲，优先减小 MOTOR_PULSE_MAX_MS；若响应仍慢，再增加 MOTOR_PULSE_MIN_MS。
- */
-#define MOTOR_ACCEL_LEVEL          (5)     /* 温和加速，避免短脉冲尚未起转便被停止 */
-#define MOTOR_MIN_SPEED_RPM        (3)
-#define MOTOR_MAX_SPEED_RPM        (10)
-#define MOTOR_SPEED_HYSTERESIS_RPM (1)
-#define MOTOR_PULSE_MIN_MS         (90)    /* 靠近中心时也保证产生可见但有限的微调 */
-#define MOTOR_PULSE_MAX_MS         (140)   /* 偏离最大时的单次调整上限，仍不是连续转动 */
-#define MOTOR_PULSE_GAP_MS         (50)    /* 停下后等待画面稳定，再执行下一次微调 */
-#define MOTOR_CAN_TX_TIMEOUT_MS    (10)    /* 等待 CAN 硬件完成发送的最长时间 */
-#define VISION_LOST_TIMEOUT_MS     (1500)  /* K230 帧较稀疏：1.5 s 无视觉数据才停止 */
+#define PID_FILTER_DIVISOR                (2)   /* Faster feedback: new sample weight 1/2 */
+#define PID_KP_NUM                         (60) /* Kp = 0.60: stronger correction */
+#define PID_KI_NUM                          (0) /* Ki = 0.01 / frame */
+#define PID_KD_NUM                         (55) /* Kd = 0.55 */
+#define PID_GAIN_DEN                      (100)
+#define PID_INTEGRAL_LIMIT              (6000)
+#define PID_OUTPUT_LIMIT                (1250)
+#define PID_OUTPUT_MIN                    (50)  /* 最小有效纠正量，0.50 */
+
+/* Emm_V5 / ZDT_X CAN1_MAP 参数；须与电机内部设置相同。 */
+#define MOTOR_ID                           (1)
+#define MOTOR_CHECKSUM                   (0x6B)
+#define MOTOR_DIR_CW                     (0x00)
+#define MOTOR_DIR_CCW                    (0x01)
 
 /*
- * 原机械方向沿用旧程序：球在左侧时电机 CW，球在右侧时电机 CCW。
- * 若实际调整方向相反，请将该宏改为 1，无须改控制算法。
+ * 本机构当前接线/机械方向：抬高水管=CCW，降低水管=CW。
+ * 首次上机时务必低速验证；若方向相反，只交换下面两个宏，不要改 PID 符号。
  */
-#define MOTOR_REVERSE_DIRECTION    (0)    /* 机械实际方向与原设定相反，交换 CW/CCW */
+#define MOTOR_DIRECTION_RAISE     MOTOR_DIR_CW
+#define MOTOR_DIRECTION_LOWER     MOTOR_DIR_CCW
 
-/* CAN1_MAP：扩展帧 ID = 电机地址 << 8。ID=1 时为 0x00000100。 */
-#define MOTOR_CAN_EXT_ID            ((uint32_t)MOTOR_ID << 8U)
-#define MOTOR_CAN_TX_BUFFER          (0U)
+/* F6 为持续速度命令。采用短脉冲以减小每次水管位移。 */
+#define MOTOR_ACCEL_LEVEL                  (3)
+#define MOTOR_MIN_SPEED_RPM                (5)
+#define MOTOR_CRUISE_SPEED_RPM             (6)  /* Faster correction away from balance */
+#define MOTOR_MAX_SPEED_RPM                (7)
+#define MOTOR_PULSE_MIN_MS                (50)  /* Keep a correction active between normal camera frames. */
+#define MOTOR_CRUISE_PULSE_MS             (70)
+#define MOTOR_PULSE_MAX_MS                (90)
+#define MOTOR_PULSE_GAP_MS                 (0)  /* New measurements refresh the pulse instead of forcing a stop. */
+#define ACTUATOR_RAISE_LIMIT_RPM_MS       (MOTOR_CRUISE_SPEED_RPM * 120)
+#define ACTUATOR_LOWER_LIMIT_RPM_MS       (MOTOR_CRUISE_SPEED_RPM * 120)
+#define MOTOR_DIRECTION_SETTLE_MS         (10)  /* Fast correction after a confirmed center crossing */
+#define MOTOR_CAN_TX_TIMEOUT_MS           (10)
+#define VISION_LOST_TIMEOUT_MS           (300)
+#define VISION_FRAME_LOSS_CONFIRM_MS       (80)  /* No UART frame for this long is treated as a dropped vision stream. */
+#define VISION_LOST_LEFT_DELTA              (4)  /* 0.04 cm leftward movement between two valid frames. */
+#define VISION_LOST_CONTINUE_SPEED_RPM       (6)
+#define VISION_LOST_CONTINUE_PULSE_MS      (100)
+
+#define MOTOR_CAN_EXT_ID          ((uint32_t)MOTOR_ID << 8U)
+#define MOTOR_CAN_TX_BUFFER                 (0U)
+#define MOTOR_DEBUG                          (0)
 
 typedef enum {
     MOTOR_STATE_UNKNOWN = 0,
@@ -56,97 +105,281 @@ typedef enum {
     MOTOR_STATE_RUNNING
 } MotorState;
 
+typedef struct {
+    int filtered_position;
+    int previous_error;
+    int previous_raw_error;
+    int integral;
+    uint8_t valid;
+    uint8_t crossed_target;
+} BallPidController;
+
+typedef enum {
+    TRAJECTORY_WAIT_AT_ORIGIN = 0,
+    TRAJECTORY_MOVE_TO_PLUS,
+    TRAJECTORY_MOVE_TO_MINUS,
+    TRAJECTORY_HOLD_AT_MINUS,
+    TRAJECTORY_DONE,
+    TRAJECTORY_TIMEOUT
+} TrajectoryState;
+
+typedef struct {
+    TrajectoryState state;
+    uint16_t elapsed_ms;
+    uint8_t consecutive_in_target_frames;
+    int reference_position; /* 斜坡后的 PID 设定值，不直接跳到 +/-5 cm */
+} TrajectoryController;
+
 static MotorState g_motor_state = MOTOR_STATE_UNKNOWN;
-static uint8_t    g_last_direction = MOTOR_DIR_CW;
-static uint16_t   g_last_speed_rpm = 0;
-static uint8_t    g_can_ready = 0;
-static uint16_t   g_motor_pulse_ms_left = 0;
-static uint16_t   g_motor_pulse_gap_ms_left = 0;
+static uint8_t g_last_direction = MOTOR_DIRECTION_RAISE;
+static uint8_t g_can_ready = 0U;
+static uint8_t g_motor_enabled = 0U;
+static uint16_t g_motor_pulse_ms_left = 0U;
+static uint16_t g_motor_pulse_gap_ms_left = 0U;
+static uint16_t g_active_speed_rpm = 0U;
+static int32_t g_actuator_offset_rpm_ms = 0;
+static BallPidController g_pid = {0};
+static TrajectoryController g_trajectory = { TRAJECTORY_WAIT_AT_ORIGIN, 0U, 0U, TRAJECTORY_ORIGIN_POSITION };
+static int g_previous_ball_position = 0;
+static int g_latest_ball_position = 0;
+static uint8_t g_ball_position_history_count = 0U;
 
-/* 将 K230 的横坐标限制为方向控制值：左=-1，中心=0，右=1。 */
-static int map_k230_x_to_control(int raw_x)
+static int clamp_int(int value, int min_value, int max_value)
 {
-    if (raw_x < -K230_X_DEADBAND_PIXELS) {
-        return BALL_X_MIN;
+    if (value < min_value) {
+        return min_value;
     }
-    if (raw_x > K230_X_DEADBAND_PIXELS) {
-        return BALL_X_MAX;
+    if (value > max_value) {
+        return max_value;
     }
-    return 0;
-}
-/* 返回与 |x| 成比例的速度：偏差越大，修正越快。 */
-static uint16_t calculate_speed_rpm(int abs_raw_x)
-{
-    int active_range = K230_X_HALF_RANGE - K230_X_DEADBAND_PIXELS;
-    int speed_range = MOTOR_MAX_SPEED_RPM - MOTOR_MIN_SPEED_RPM;
-    int clamped_raw_x = abs_raw_x;
-    int speed;
-
-    if (clamped_raw_x > K230_X_HALF_RANGE) {
-        clamped_raw_x = K230_X_HALF_RANGE;
-    }
-    if (active_range <= 0) {
-        return MOTOR_MIN_SPEED_RPM;
-    }
-
-    speed = MOTOR_MIN_SPEED_RPM
-            + ((clamped_raw_x - K230_X_DEADBAND_PIXELS) * speed_range) / active_range;
-
-    if (speed < MOTOR_MIN_SPEED_RPM) {
-        speed = MOTOR_MIN_SPEED_RPM;
-    }
-    if (speed > MOTOR_MAX_SPEED_RPM) {
-        speed = MOTOR_MAX_SPEED_RPM;
-    }
-    return (uint16_t)speed;
+    return value;
 }
 
-/* 偏差越小时脉冲越短，避免小球刚接近中心又被推到另一侧。 */
-static uint16_t calculate_pulse_ms(int abs_raw_x)
+static int abs_int(int value)
 {
-    int active_range = K230_X_HALF_RANGE - K230_X_DEADBAND_PIXELS;
-    int pulse_range = MOTOR_PULSE_MAX_MS - MOTOR_PULSE_MIN_MS;
-    int clamped_raw_x = abs_raw_x;
-    int pulse_ms;
+    return (value < 0) ? -value : value;
+}
 
-    if (clamped_raw_x > K230_X_HALF_RANGE) {
-        clamped_raw_x = K230_X_HALF_RANGE;
-    }
-    if (active_range <= 0) {
-        return MOTOR_PULSE_MIN_MS;
+/* cx=-320 映射为 -12.50；cx=0 映射为 0；cx=319 映射为 +12.50。 */
+static int ball_x_pixels_to_position(int cx_pixels)
+{
+    cx_pixels = clamp_int(cx_pixels, K230_LEFT_EDGE_OFFSET_PIXELS,
+                          K230_RIGHT_EDGE_OFFSET_PIXELS);
+
+    if (cx_pixels < K230_CENTER_X_OFFSET_PIXELS) {
+        return (cx_pixels * BALL_POSITION_LIMIT) /
+               (-K230_LEFT_EDGE_OFFSET_PIXELS);
     }
 
-    pulse_ms = MOTOR_PULSE_MIN_MS
-             + ((clamped_raw_x - K230_X_DEADBAND_PIXELS) * pulse_range) / active_range;
+    return (cx_pixels * BALL_POSITION_LIMIT) /
+           K230_RIGHT_EDGE_OFFSET_PIXELS;
+}
 
-    if (pulse_ms < MOTOR_PULSE_MIN_MS) {
-        pulse_ms = MOTOR_PULSE_MIN_MS;
+static void record_ball_position(int position)
+{
+    if (g_ball_position_history_count > 0U) {
+        g_previous_ball_position = g_latest_ball_position;
     }
-    if (pulse_ms > MOTOR_PULSE_MAX_MS) {
-        pulse_ms = MOTOR_PULSE_MAX_MS;
+    g_latest_ball_position = position;
+    if (g_ball_position_history_count < 2U) {
+        g_ball_position_history_count++;
     }
-    return (uint16_t)pulse_ms;
+}
+
+static uint8_t ball_was_rolling_left(void)
+{
+    return ((g_ball_position_history_count >= 2U) &&
+            ((g_latest_ball_position - g_previous_ball_position) <=
+             -VISION_LOST_LEFT_DELTA)) ? 1U : 0U;
+}
+
+static uint8_t ball_was_rolling_right(void)
+{
+    return ((g_ball_position_history_count >= 2U) &&
+            ((g_latest_ball_position - g_previous_ball_position) >=
+             VISION_LOST_LEFT_DELTA)) ? 1U : 0U;
+}
+
+static void ball_pid_reset(void)
+{
+    g_pid.filtered_position = 0;
+    g_pid.previous_error = 0;
+    g_pid.previous_raw_error = 0;
+    g_pid.integral = 0;
+    g_pid.valid = 0U;
+    g_pid.crossed_target = 0U;
 }
 
 /*
- * 直接 CAN 控制（不再使用 PB2/PB3 的 UART3）。
- * CAN1_MAP 协议要求：500 kbps、经典 CAN、扩展帧、CAN ID = 电机 ID << 8。
- * 串口协议中的第一个“地址”字节不放入 CAN 数据区，例如：
- * Emm_V5 UART: 01 F6 direction speed(H,L) acceleration sync 6B
- * Emm_V5 CAN : ID=0x100, DLC=7, DATA=F6 direction speed(H,L) acceleration sync 6B
+ * 输出为带符号的 PID 命令：
+ *   正数 => 小球在中心左侧（x<0）=> 抬高水管；
+ *   负数 => 小球在中心右侧（x>0）=> 降低水管。
  */
+static int ball_pid_update(int raw_position, int target_position)
+{
+    int raw_error;
+    int error;
+    int derivative;
+    int next_integral;
+    int command;
+    int position_delta = 0;
+    int brake_zone;
+    int32_t numerator;
+
+    raw_position = clamp_int(raw_position, -BALL_POSITION_LIMIT,
+                             BALL_POSITION_LIMIT);
+    raw_error = target_position - raw_position;
+    g_pid.crossed_target = 0U;
+
+    if (g_pid.valid == 0U) {
+        g_pid.filtered_position = raw_position;
+        g_pid.previous_error = raw_error;
+        g_pid.previous_raw_error = raw_error;
+        g_pid.integral = 0;
+        g_pid.valid = 1U;
+    } else {
+        int previous_filtered_position = g_pid.filtered_position;
+
+        /*
+         * Do not let the position low-pass filter hide a confirmed crossing
+         * of the balance point.  On a crossing, use the raw position now,
+         * reset integral, and let motor_track_ball stop/reverse immediately.
+         */
+        if (((raw_error > BALL_POSITION_DEADBAND) &&
+             (g_pid.previous_raw_error < -BALL_POSITION_DEADBAND)) ||
+            ((raw_error < -BALL_POSITION_DEADBAND) &&
+             (g_pid.previous_raw_error > BALL_POSITION_DEADBAND))) {
+            g_pid.crossed_target = 1U;
+            g_pid.filtered_position = raw_position;
+            g_pid.integral = 0;
+        } else {
+            g_pid.filtered_position +=
+                (raw_position - g_pid.filtered_position) / PID_FILTER_DIVISOR;
+        }
+        position_delta = g_pid.filtered_position - previous_filtered_position;
+    }
+
+    error = target_position - g_pid.filtered_position;
+    derivative = error - g_pid.previous_error;
+
+    if (abs_int(error) <= BALL_POSITION_DEADBAND) {
+        g_pid.integral = (g_pid.integral * 3) / 4;
+        g_pid.previous_error = error;
+        g_pid.previous_raw_error = raw_error;
+        return 0;
+    }
+
+    /* Expand the no-drive zone when the ball is approaching O quickly. */
+    brake_zone = clamp_int(BALL_BRAKE_ZONE +
+                           (abs_int(position_delta) * BALL_PREDICTIVE_BRAKE_GAIN),
+                           BALL_BRAKE_ZONE, BALL_BRAKE_ZONE_MAX);
+    if ((abs_int(error) <= brake_zone) &&
+        (abs_int(position_delta) >= BALL_MOTION_THRESHOLD) &&
+        (((error > 0) && (position_delta > 0)) ||
+         ((error < 0) && (position_delta < 0)))) {
+        g_pid.integral = (g_pid.integral * 3) / 4;
+        g_pid.previous_error = error;
+        g_pid.previous_raw_error = raw_error;
+        return 0;
+    }
+
+    next_integral = clamp_int(g_pid.integral + error,
+                              -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
+    numerator = ((int32_t)PID_KP_NUM * error) +
+                ((int32_t)PID_KI_NUM * next_integral) +
+                ((int32_t)PID_KD_NUM * derivative);
+    command = (int)(numerator / PID_GAIN_DEN);
+    command = clamp_int(command, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT);
+
+    if (!((command >= PID_OUTPUT_LIMIT) && (error > 0)) &&
+        !((command <= -PID_OUTPUT_LIMIT) && (error < 0))) {
+        g_pid.integral = next_integral;
+    }
+    g_pid.previous_error = error;
+    g_pid.previous_raw_error = raw_error;
+
+    if (((error > 0) && (command <= 0)) ||
+        ((error < 0) && (command >= 0)) ||
+        (abs_int(command) < PID_OUTPUT_MIN)) {
+        command = (error > 0) ? PID_OUTPUT_MIN : -PID_OUTPUT_MIN;
+    }
+    return command;
+}
+
+/*
+ * 减速带相对“当前目标点”计算，而不是相对 O 点计算。
+ * 这样 O -> +5 cm 和 +5 -> -5 cm 的中段始终采用巡航能力，只有接近每个目标时
+ * 才逐步减速，避免之前在 O 点附近被过早限速。
+ */
+static int calculate_slow_zone_scale(int abs_error)
+{
+    if (abs_error >= BALL_TARGET_SLOW_ZONE) {
+        return 100;
+    }
+    if (abs_error <= BALL_POSITION_DEADBAND) {
+        return 0;
+    }
+    return ((abs_error - BALL_POSITION_DEADBAND) * 100) /
+           (BALL_TARGET_SLOW_ZONE - BALL_POSITION_DEADBAND);
+}
+
+static uint16_t calculate_speed_rpm(int effort, int abs_error)
+{
+    int speed_range = MOTOR_MAX_SPEED_RPM - MOTOR_MIN_SPEED_RPM;
+    int full_speed;
+    int slow_zone_scale;
+    int speed;
+
+    effort = clamp_int(effort, PID_OUTPUT_MIN, PID_OUTPUT_LIMIT);
+    full_speed = MOTOR_MIN_SPEED_RPM +
+        ((effort - PID_OUTPUT_MIN) * speed_range) /
+        (PID_OUTPUT_LIMIT - PID_OUTPUT_MIN);
+    if (abs_error >= BALL_TARGET_SLOW_ZONE) {
+        full_speed = clamp_int(full_speed, MOTOR_CRUISE_SPEED_RPM,
+                               MOTOR_MAX_SPEED_RPM);
+    }
+
+    slow_zone_scale = calculate_slow_zone_scale(abs_error);
+    speed = MOTOR_MIN_SPEED_RPM +
+        ((full_speed - MOTOR_MIN_SPEED_RPM) * slow_zone_scale) / 100;
+    return (uint16_t)clamp_int(speed, MOTOR_MIN_SPEED_RPM, MOTOR_MAX_SPEED_RPM);
+}
+
+static uint16_t calculate_pulse_ms(int effort, int abs_error)
+{
+    int pulse_range = MOTOR_PULSE_MAX_MS - MOTOR_PULSE_MIN_MS;
+    int full_pulse;
+    int slow_zone_scale;
+    int pulse;
+
+    effort = clamp_int(effort, PID_OUTPUT_MIN, PID_OUTPUT_LIMIT);
+    full_pulse = MOTOR_PULSE_MIN_MS +
+        ((effort - PID_OUTPUT_MIN) * pulse_range) /
+        (PID_OUTPUT_LIMIT - PID_OUTPUT_MIN);
+    if (abs_error >= BALL_TARGET_SLOW_ZONE) {
+        full_pulse = clamp_int(full_pulse, MOTOR_CRUISE_PULSE_MS,
+                               MOTOR_PULSE_MAX_MS);
+    }
+
+    slow_zone_scale = calculate_slow_zone_scale(abs_error);
+    pulse = MOTOR_PULSE_MIN_MS +
+        ((full_pulse - MOTOR_PULSE_MIN_MS) * slow_zone_scale) / 100;
+    return (uint16_t)clamp_int(pulse, MOTOR_PULSE_MIN_MS, MOTOR_PULSE_MAX_MS);
+}
+
+/* 近似延时，仅用于 CAN 请求等待与主循环约 1 ms 节拍。 */
 static void motor_delay_us(uint32_t microseconds)
 {
     volatile uint32_t i;
 
-    /* 近似延时，仅用于视觉看门狗和 CAN 发送完成等待。 */
     while (microseconds-- > 0U) {
-        for (i = 0; i < 8U; i++) {
+        for (i = 0U; i < 8U; i++) {
             __asm("nop");
         }
     }
 }
 
+#if MOTOR_DEBUG
 static void motor_debug_can_frame(const uint8_t *data, uint8_t length)
 {
     char debug_buf[80];
@@ -155,50 +388,46 @@ static void motor_debug_can_frame(const uint8_t *data, uint8_t length)
 
     offset = sprintf(debug_buf, "Motor CAN TX: ID=%08lX DLC=%u DATA=",
                      (unsigned long)MOTOR_CAN_EXT_ID, (unsigned int)length);
-    for (i = 0; (i < length) && (offset < (int)(sizeof(debug_buf) - 5U)); i++) {
+    for (i = 0U; (i < length) && (offset < (int)(sizeof(debug_buf) - 5U)); i++) {
         offset += sprintf(&debug_buf[offset], "%02X ", data[i]);
     }
     sprintf(&debug_buf[offset], "\r\n");
     uart0_send_string(debug_buf);
 }
+#endif
 
-/*
- * 发送一帧经典 CAN 扩展帧，并以“TX 请求是否清除”判断总线是否真正完成发送。
- * 若 SN65HVD230 断线、CANH/CANL 颠倒、RS 处于待机，或电机波特率不为 500k，
- * TX 请求会持续挂起；此时取消请求，避免一个失败帧堵住下一帧。
- */
 static uint8_t motor_can_send(const uint8_t *data, uint8_t length)
 {
     DL_MCAN_TxBufElement tx_msg = {0};
-    DL_MCAN_ProtocolStatus protocol_status;
     uint16_t elapsed_20us;
-    char debug_buf[88];
 
     if ((!g_can_ready) || (data == 0) || (length == 0U) || (length > 8U)) {
-        return 0;
+        return 0U;
     }
 
-    /* 上一次请求若仍在等待 ACK，先取消，确保 TX buffer 0 可复用。 */
-    if ((DL_MCAN_getTxBufReqPend(MCAN0_INST) & (1UL << MOTOR_CAN_TX_BUFFER)) != 0U) {
+    if ((DL_MCAN_getTxBufReqPend(MCAN0_INST) &
+         (1UL << MOTOR_CAN_TX_BUFFER)) != 0U) {
         (void)DL_MCAN_txBufCancellationReq(MCAN0_INST, MOTOR_CAN_TX_BUFFER);
-        motor_delay_us(100);
+        motor_delay_us(100U);
     }
 
-    tx_msg.id  = MOTOR_CAN_EXT_ID;
-    tx_msg.rtr = 0U;               /* data frame */
-    tx_msg.xtd = 1U;               /* 29-bit extended CAN identifier */
+    tx_msg.id = MOTOR_CAN_EXT_ID;
+    tx_msg.rtr = 0U;
+    tx_msg.xtd = 1U;
     tx_msg.esi = 0U;
     tx_msg.dlc = length;
-    tx_msg.brs = 0U;               /* classic CAN: no bitrate switching */
-    tx_msg.fdf = 0U;               /* classic CAN, not CAN-FD */
+    tx_msg.brs = 0U;
+    tx_msg.fdf = 0U;
     tx_msg.efc = 0U;
-    tx_msg.mm  = 0U;
+    tx_msg.mm = 0U;
 
     for (uint8_t i = 0U; i < length; i++) {
         tx_msg.data[i] = data[i];
     }
 
+#if MOTOR_DEBUG
     motor_debug_can_frame(data, length);
+#endif
     DL_MCAN_writeMsgRam(MCAN0_INST, DL_MCAN_MEM_TYPE_BUF,
                         MOTOR_CAN_TX_BUFFER, &tx_msg);
     DL_MCAN_TXBufAddReq(MCAN0_INST, MOTOR_CAN_TX_BUFFER);
@@ -208,82 +437,86 @@ static uint8_t motor_can_send(const uint8_t *data, uint8_t length)
          elapsed_20us++) {
         if ((DL_MCAN_getTxBufReqPend(MCAN0_INST) &
              (1UL << MOTOR_CAN_TX_BUFFER)) == 0U) {
-            uart0_send_string("Motor CAN TX OK (physical ACK)\r\n");
-            return 1;
+            return 1U;
         }
-        motor_delay_us(20);
+        motor_delay_us(20U);
     }
 
-    DL_MCAN_getProtocolStatus(MCAN0_INST, &protocol_status);
-    sprintf(debug_buf,
-            "Motor CAN TX timeout: pending=%08lX lec=%lu passive=%lu warn=%lu busoff=%lu\r\n",
-            (unsigned long)DL_MCAN_getTxBufReqPend(MCAN0_INST),
-            (unsigned long)protocol_status.lastErrCode,
-            (unsigned long)protocol_status.errPassive,
-            (unsigned long)protocol_status.warningStatus,
-            (unsigned long)protocol_status.busOffStatus);
-    uart0_send_string(debug_buf);
-
     (void)DL_MCAN_txBufCancellationReq(MCAN0_INST, MOTOR_CAN_TX_BUFFER);
-    return 0;
+    return 0U;
 }
 
 /* DATA = F3 AB enable sync 6B */
 static uint8_t motor_enable(uint8_t enable)
 {
-    const uint8_t data[5] = {
-        0xF3, 0xAB, enable ? 0x01 : 0x00, 0x00, MOTOR_CHECKSUM
-    };
+    const uint8_t data[5] = { 0xF3, 0xAB, enable ? 0x01 : 0x00, 0x00,
+                              MOTOR_CHECKSUM };
+    uint8_t success = motor_can_send(data, sizeof(data));
 
-    return motor_can_send(data, sizeof(data));
+    if (success != 0U) {
+        g_motor_enabled = enable ? 1U : 0U;
+    }
+    return success;
 }
 
-/*
- * Emm_V5: DATA = F6 direction speed(H,L) acceleration sync 6B。
- * 注意：CAN 数据区只有 7 字节；速度单位就是 RPM，不能乘以 10。
- * 旧代码按 ZDT_X V2 格式发送了 8 字节，电机会把字段错位解析而不执行。
- */
+/* DATA = F6 direction speed(H,L) acceleration sync 6B */
 static uint8_t motor_set_speed(uint8_t direction, uint16_t speed_rpm)
 {
     uint8_t data[7];
 
+    if ((g_motor_enabled == 0U) && (motor_enable(1U) == 0U)) {
+        return 0U;
+    }
+
     data[0] = 0xF6;
     data[1] = direction;
     data[2] = (uint8_t)(speed_rpm >> 8);
-    data[3] = (uint8_t)(speed_rpm & 0xFF);
+    data[3] = (uint8_t)(speed_rpm & 0xFFU);
     data[4] = MOTOR_ACCEL_LEVEL;
-    data[5] = 0x00;                /* 不使用多机同步 */
+    data[5] = 0x00;
     data[6] = MOTOR_CHECKSUM;
-
-    /* 每次新的速度请求先发送 F3 使能，确保 Hold 模式下电机已被逻辑使能。 */
-    if (!motor_enable(1)) {
-        return 0;
-    }
     return motor_can_send(data, sizeof(data));
 }
 
-/* DATA = FE 98 sync 6B：立即停止 */
+/* DATA = FE 98 sync 6B：立即停止。 */
 static void motor_stop(void)
 {
     const uint8_t data[4] = { 0xFE, 0x98, 0x00, MOTOR_CHECKSUM };
 
-    if (g_motor_state == MOTOR_STATE_STOPPED) {
-        return;
+    if (g_motor_state != MOTOR_STATE_STOPPED) {
+        (void)motor_can_send(data, sizeof(data));
     }
-
-    (void)motor_can_send(data, sizeof(data));
     g_motor_state = MOTOR_STATE_STOPPED;
-    g_last_speed_rpm = 0;
     g_motor_pulse_ms_left = 0U;
+    g_active_speed_rpm = 0U;
 }
 
-/*
- * F6 为持续转动命令。本控制器只让它保持当前计算出的短脉冲，随后发 FE 停止，
- * 并留出一段时间等待 K230 画面更新，防止一次命令把钢球推过中心。
- * 本函数在主循环中每约 1 ms 调用一次。
- */
+static uint8_t actuator_can_move(uint8_t direction)
+{
+    if (direction == MOTOR_DIRECTION_RAISE) {
+        return (g_actuator_offset_rpm_ms < ACTUATOR_RAISE_LIMIT_RPM_MS) ? 1U : 0U;
+    }
+    return (g_actuator_offset_rpm_ms > -ACTUATOR_LOWER_LIMIT_RPM_MS) ? 1U : 0U;
+}
+
 static void motor_control_tick_1ms(void)
 {
+    if (g_motor_state == MOTOR_STATE_RUNNING) {
+        if (g_last_direction == MOTOR_DIRECTION_RAISE) {
+            if (g_actuator_offset_rpm_ms >= ACTUATOR_RAISE_LIMIT_RPM_MS) {
+                motor_stop();
+                return;
+            }
+            g_actuator_offset_rpm_ms += g_active_speed_rpm;
+        } else {
+            if (g_actuator_offset_rpm_ms <= -ACTUATOR_LOWER_LIMIT_RPM_MS) {
+                motor_stop();
+                return;
+            }
+            g_actuator_offset_rpm_ms -= g_active_speed_rpm;
+        }
+    }
+
     if (g_motor_pulse_ms_left > 0U) {
         g_motor_pulse_ms_left--;
         if (g_motor_pulse_ms_left == 0U) {
@@ -295,7 +528,38 @@ static void motor_control_tick_1ms(void)
     }
 }
 
-/* 确认 MCAN 已进入正常模式；未就绪时只打印一次，电机不会误动作。 */
+/* Continue the last confirmed roll direction while vision is temporarily lost. */
+static void motor_continue_in_direction_on_vision_loss(uint8_t direction)
+{
+    if (actuator_can_move(direction) == 0U) {
+        motor_stop();
+        return;
+    }
+
+    if (g_motor_state == MOTOR_STATE_RUNNING) {
+        if (g_last_direction == direction) {
+            g_motor_pulse_ms_left = VISION_LOST_CONTINUE_PULSE_MS;
+            return;
+        }
+
+        motor_stop();
+        g_motor_pulse_gap_ms_left = 0U;
+        return;
+    }
+
+    g_motor_pulse_gap_ms_left = 0U;
+    if (motor_set_speed(direction,
+                        VISION_LOST_CONTINUE_SPEED_RPM) != 0U) {
+        g_motor_state = MOTOR_STATE_RUNNING;
+        g_last_direction = direction;
+        g_active_speed_rpm = VISION_LOST_CONTINUE_SPEED_RPM;
+        g_motor_pulse_ms_left = VISION_LOST_CONTINUE_PULSE_MS;
+    } else {
+        g_motor_enabled = 0U;
+        g_motor_state = MOTOR_STATE_STOPPED;
+    }
+}
+
 static void motor_can_init(void)
 {
     uint16_t elapsed_ms;
@@ -303,126 +567,330 @@ static void motor_can_init(void)
     for (elapsed_ms = 0U; elapsed_ms < 50U; elapsed_ms++) {
         if (DL_MCAN_getOpMode(MCAN0_INST) == DL_MCAN_OPERATION_MODE_NORMAL) {
             g_can_ready = 1U;
-            uart0_send_string("CAN ready: 500 kbps, XTD ID=0x00000100, PA12/PA13\r\n");
             return;
         }
-        motor_delay_us(1000);
+        motor_delay_us(1000U);
     }
-
-    uart0_send_string("CAN init failed: MCAN is not in NORMAL mode\r\n");
 }
 
-/* 根据当前钢球 x 坐标更新电机状态。 */
-static void motor_track_ball_x(int raw_x)
+static uint8_t motor_direction_from_pid_command(int command)
 {
-    char debug_buf[80];
-    int x = map_k230_x_to_control(raw_x);
-    int abs_raw_x = (raw_x < 0) ? -raw_x : raw_x;
-    uint8_t direction;
-    uint16_t speed_rpm;
-    uint16_t pulse_ms;
+    return (command > 0) ? MOTOR_DIRECTION_RAISE : MOTOR_DIRECTION_LOWER;
+}
 
-    if (x == 0) {
+static int trajectory_goal_position(void)
+{
+#if TRAJECTORY_TEST_ENABLE
+    switch (g_trajectory.state) {
+        case TRAJECTORY_MOVE_TO_PLUS:
+            return TRAJECTORY_PLUS_TARGET;
+        case TRAJECTORY_MOVE_TO_MINUS:
+        case TRAJECTORY_HOLD_AT_MINUS:
+        case TRAJECTORY_DONE:
+            return TRAJECTORY_MINUS_TARGET;
+        case TRAJECTORY_WAIT_AT_ORIGIN:
+        case TRAJECTORY_TIMEOUT:
+        default:
+            return TRAJECTORY_ORIGIN_POSITION;
+    }
+#else
+    return TRAJECTORY_ORIGIN_POSITION;
+#endif
+}
+
+static uint8_t trajectory_is_active(void)
+{
+    return ((g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) ||
+            (g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) ||
+            (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS)) ? 1U : 0U;
+}
+
+/*
+ * 目标斜坡发生在每一帧新视觉数据到达时，并加入“参考值不能领先小球太多”的
+ * 跟随窗口。这样轨迹起步为小步试探：先给一小段设定值，确认小球开始响应后才
+ * 继续前进；小球未跟上时立即冻结设定值等待反馈。
+ */
+static void trajectory_advance_reference(int measured_position)
+{
+#if TRAJECTORY_TEST_ENABLE
+    int goal = trajectory_goal_position();
+    int difference = goal - g_trajectory.reference_position;
+    int next_reference;
+    int reference_limit;
+
+    if (difference == 0) {
+        return;
+    }
+
+    if (difference > 0) {
+        /* 向 + 方向时，PID 参考值不能超过“小球实测位置 + 0.45 cm”。 */
+        reference_limit = measured_position + TRAJECTORY_REFERENCE_FOLLOW_WINDOW;
+        next_reference = g_trajectory.reference_position +
+            ((difference > TRAJECTORY_REFERENCE_STEP_PER_FRAME) ?
+             TRAJECTORY_REFERENCE_STEP_PER_FRAME : difference);
+        if (next_reference > reference_limit) {
+            next_reference = reference_limit;
+        }
+        if (next_reference > g_trajectory.reference_position) {
+            g_trajectory.reference_position = next_reference;
+        }
+    } else {
+        /* 向 - 方向时，PID 参考值不能低于“小球实测位置 - 0.45 cm”。 */
+        reference_limit = measured_position - TRAJECTORY_REFERENCE_FOLLOW_WINDOW;
+        next_reference = g_trajectory.reference_position -
+            (((-difference) > TRAJECTORY_REFERENCE_STEP_PER_FRAME) ?
+             TRAJECTORY_REFERENCE_STEP_PER_FRAME : (-difference));
+        if (next_reference < reference_limit) {
+            next_reference = reference_limit;
+        }
+        if (next_reference < g_trajectory.reference_position) {
+            g_trajectory.reference_position = next_reference;
+        }
+    }
+#endif
+}
+
+static int trajectory_control_target_position(void)
+{
+#if TRAJECTORY_TEST_ENABLE
+    return g_trajectory.reference_position;
+#else
+    return TRAJECTORY_ORIGIN_POSITION;
+#endif
+}
+
+/* 每个有效视觉帧更新一次轨迹状态；连续帧确认抑制单帧误检触发折返。 */
+static void trajectory_update_on_measurement(int position)
+{
+#if TRAJECTORY_TEST_ENABLE
+    int target = trajectory_goal_position();
+    int tolerance;
+    uint8_t confirm_frames;
+
+    if ((g_trajectory.state == TRAJECTORY_DONE) ||
+        (g_trajectory.state == TRAJECTORY_TIMEOUT)) {
+        return;
+    }
+
+    if (g_trajectory.state == TRAJECTORY_WAIT_AT_ORIGIN) {
+        tolerance = TRAJECTORY_START_TOLERANCE;
+        confirm_frames = TRAJECTORY_START_CONFIRM_FRAMES;
+    } else {
+        tolerance = TRAJECTORY_TARGET_TOLERANCE;
+        confirm_frames = (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS) ?
+            TRAJECTORY_FINAL_STABLE_FRAMES : TRAJECTORY_TURN_CONFIRM_FRAMES;
+    }
+
+    if (abs_int(position - target) > tolerance) {
+        g_trajectory.consecutive_in_target_frames = 0U;
+        return;
+    }
+
+    if (g_trajectory.consecutive_in_target_frames < confirm_frames) {
+        g_trajectory.consecutive_in_target_frames++;
+    }
+    if (g_trajectory.consecutive_in_target_frames < confirm_frames) {
+        return;
+    }
+
+    g_trajectory.consecutive_in_target_frames = 0U;
+    ball_pid_reset();
+    switch (g_trajectory.state) {
+        case TRAJECTORY_WAIT_AT_ORIGIN:
+            /*
+             * 已在 O 点稳定，先以当前实测位置作为参考轨迹起点，再缓慢向 +5 cm
+             * 前进；避免 O 点存在少量偏差时仍产生一次突发阶跃。
+             */
+            g_trajectory.reference_position = position;
+            g_trajectory.state = TRAJECTORY_MOVE_TO_PLUS;
+            g_trajectory.elapsed_ms = 0U;
+            break;
+        case TRAJECTORY_MOVE_TO_PLUS:
+            /* 到达 +5 cm（误差 <= 1 cm）后立即折返。 */
+            g_trajectory.state = TRAJECTORY_MOVE_TO_MINUS;
+            break;
+        case TRAJECTORY_MOVE_TO_MINUS:
+            /* 首次进入 -5 cm 容差带，继续保持以验证稳定性。 */
+            g_trajectory.state = TRAJECTORY_HOLD_AT_MINUS;
+            break;
+        case TRAJECTORY_HOLD_AT_MINUS:
+            /* 连续稳定帧满足后，测试通过，仍维持 -5 cm 目标。 */
+            g_trajectory.state = TRAJECTORY_DONE;
+            break;
+        default:
+            break;
+    }
+#else
+    (void)position;
+#endif
+}
+
+/* 从开始向 +5 cm 运动起计时；超过 5 s 未完成时安全停止。 */
+static void trajectory_tick_1ms(void)
+{
+#if TRAJECTORY_TEST_ENABLE
+    if (trajectory_is_active() == 0U) {
+        return;
+    }
+
+    if (g_trajectory.elapsed_ms < TRAJECTORY_MAX_TIME_MS) {
+        g_trajectory.elapsed_ms++;
+    }
+    if (g_trajectory.elapsed_ms >= TRAJECTORY_MAX_TIME_MS) {
+        g_trajectory.state = TRAJECTORY_TIMEOUT;
+        g_trajectory.consecutive_in_target_frames = 0U;
+        ball_pid_reset();
+        motor_stop();
+    }
+#endif
+}
+
+/* 每个有效新帧调用一次。target_position 可为 O、+5 cm 或 -5 cm。 */
+static void motor_track_ball(const BallInfo *ball, int target_position)
+{
+    int position;
+    int command;
+    int abs_error;
+    uint8_t direction;
+    uint16_t pulse_ms;
+    uint16_t speed_rpm;
+
+    if ((ball == 0) || (ball->score < BALL_MIN_CONFIDENCE)) {
+        ball_pid_reset();
         motor_stop();
         return;
     }
 
-    /* x < 0：球在左；x > 0：球在右。 */
-    direction = (x < 0) ? MOTOR_DIR_CW : MOTOR_DIR_CCW;
-    if (MOTOR_REVERSE_DIRECTION) {
-        direction = (direction == MOTOR_DIR_CW) ? MOTOR_DIR_CCW : MOTOR_DIR_CW;
+    position = ball_x_pixels_to_position(ball->cx);
+    command = ball_pid_update(position, target_position);
+    if (g_pid.crossed_target != 0U) {
+        /* A confirmed raw-position crossing must not wait out the old pulse gap. */
+        g_motor_pulse_gap_ms_left = 0U;
     }
-    speed_rpm = calculate_speed_rpm(abs_raw_x);
-    pulse_ms = calculate_pulse_ms(abs_raw_x);
+    if (command == 0) {
+        motor_stop();
+        return;
+    }
 
-    /*
-     * F6 会持续转动，不能随着每一帧 K230 数据重复下发。
-     * 当前有一段微调正在执行时，保持该脉冲；脉冲结束后的等待期内也不再启动，
-     * 直到相机已经看到这次调整的结果。
-     */
+    direction = motor_direction_from_pid_command(command);
+    if (actuator_can_move(direction) == 0U) {
+        ball_pid_reset();
+        motor_stop();
+        return;
+    }
+    abs_error = abs_int(position - target_position);
+    pulse_ms = calculate_pulse_ms(abs_int(command), abs_error);
+
     if (g_motor_state == MOTOR_STATE_RUNNING) {
-        /* 目标方向若反转，先立即停住；下一次画面再从相反方向微调。 */
         if (direction != g_last_direction) {
+            /* 方向反转时先刹停；防止水管惯性和 PID 积分共同放大振荡。 */
             motor_stop();
-            g_motor_pulse_gap_ms_left = MOTOR_PULSE_GAP_MS;
+            g_motor_pulse_gap_ms_left = MOTOR_DIRECTION_SETTLE_MS;
+        } else {
+            /* 新帧要求更小修正时，仅缩短当前脉冲，绝不延长它。 */
+            g_motor_pulse_ms_left = pulse_ms;
         }
         return;
     }
+
     if (g_motor_pulse_gap_ms_left > 0U) {
         return;
     }
 
-    if (motor_set_speed(direction, speed_rpm)) {
+    speed_rpm = calculate_speed_rpm(abs_int(command), abs_error);
+    if (motor_set_speed(direction, speed_rpm) != 0U) {
         g_motor_state = MOTOR_STATE_RUNNING;
         g_last_direction = direction;
-        g_last_speed_rpm = speed_rpm;
+        g_active_speed_rpm = speed_rpm;
         g_motor_pulse_ms_left = pulse_ms;
-
-        sprintf(debug_buf, "Motor micro-adjust: %s, speed=%u RPM, pulse=%u ms, raw_x=%d, x=%d\r\n",
-                (direction == MOTOR_DIR_CW) ? "CW" : "CCW", speed_rpm,
-                (unsigned int)pulse_ms, raw_x, x);
-        uart0_send_string(debug_buf);
     } else {
-        uart0_send_string("Motor command not accepted on CAN bus\r\n");
+        g_motor_enabled = 0U;
+        g_motor_state = MOTOR_STATE_STOPPED;
     }
+}
+
+/* 从 UART RX 中断写入的结果取一个完整快照。 */
+static uint8_t take_latest_ball(BallInfo *ball)
+{
+    volatile BallDetectResult *result = Pto_Get_Ball_Result();
+    uint8_t count;
+
+    if ((result == 0) || (result->new_data == 0U)) {
+        return 0U;
+    }
+
+    count = result->count;
+    if (count > 0U) {
+        ball->cx = result->balls[0].cx;
+        ball->cy = result->balls[0].cy;
+        ball->w = result->balls[0].w;
+        ball->score = result->balls[0].score;
+    }
+    result->new_data = 0U;
+    return (count > 0U) ? 1U : 2U;
 }
 
 int main(void)
 {
-    BallDetectResult *result;
-    uint16_t vision_silence_ms = 0;
+    BallInfo ball;
+    uint8_t ball_state;
+    uint16_t vision_silence_ms = 0U;
 
     SYSCFG_DL_init();
     uart0_init();
-    uart1_init();                  /* 保留 UART3(PB2/PB3)，但本版本不再用于电机 */
-    uart2_init();                  /* UART1: PA8/PA9 <- K230 */
-
-    uart0_send_string("MSPM0G3507 Ball Detect + ZDT Direct CAN Motor\r\n");
-    uart0_send_string("K230 raw x: -160..160 -> control: -1/0/1\r\n");
-    uart0_send_string("Motor CAN: PA12=TX, PA13=RX, 500 kbps\r\n");
+    uart1_init();
+    uart2_init();
     motor_can_init();
 
-    while (1)
-    {
-        result = Pto_Get_Ball_Result();
+    while (1) {
+        ball_state = take_latest_ball(&ball);
+        if (ball_state == 1U) {
+            int position = ball_x_pixels_to_position(ball.cx);
 
-        if (result->new_data)
-        {
-            result->new_data = 0;
-            vision_silence_ms = 0;
-
-            if (result->count > 0)
-            {
-                /* 当前沿用第一个检测到的钢球作为跟踪目标。 */
-                motor_track_ball_x(result->balls[0].cx);
+            vision_silence_ms = 0U;
+            if (ball.score >= BALL_MIN_CONFIDENCE) {
+                record_ball_position(position);
             }
-            else
-            {
-                /* K230 明确报告没有球时，立即停止。 */
+            trajectory_update_on_measurement(position);
+            if (g_trajectory.state == TRAJECTORY_TIMEOUT) {
+                motor_stop();
+            } else {
+                trajectory_advance_reference(position);
+                motor_track_ball(&ball, trajectory_control_target_position());
+            }
+        } else if (ball_state == 2U) {
+            vision_silence_ms = 0U;
+            if (ball_was_rolling_left() != 0U) {
+                motor_continue_in_direction_on_vision_loss(MOTOR_DIRECTION_RAISE);
+            } else if (ball_was_rolling_right() != 0U) {
+                motor_continue_in_direction_on_vision_loss(MOTOR_DIRECTION_LOWER);
+            } else {
+                ball_pid_reset();
                 motor_stop();
             }
-        }
-        else
-        {
-            /*
-             * F6 是持续转速命令。如果 K230 断线或不再发送任何帧，旧速度不会自动失效。
-             * 因此超过 200 ms 没有新的视觉帧时，强制发送 FE 停止命令，避免无球空转。
-             */
+        } else {
             if (vision_silence_ms < VISION_LOST_TIMEOUT_MS) {
                 vision_silence_ms++;
             }
-            if ((vision_silence_ms >= VISION_LOST_TIMEOUT_MS) &&
-                (g_motor_state == MOTOR_STATE_RUNNING)) {
-                uart0_send_string("Vision timeout: motor stop\r\n");
+            if ((vision_silence_ms >= VISION_FRAME_LOSS_CONFIRM_MS) &&
+                (ball_was_rolling_left() != 0U)) {
+                motor_continue_in_direction_on_vision_loss(MOTOR_DIRECTION_RAISE);
+            } else if ((vision_silence_ms >= VISION_FRAME_LOSS_CONFIRM_MS) &&
+                       (ball_was_rolling_right() != 0U)) {
+                motor_continue_in_direction_on_vision_loss(MOTOR_DIRECTION_LOWER);
+            } else if (vision_silence_ms >= VISION_LOST_TIMEOUT_MS) {
+                ball_pid_reset();
                 motor_stop();
             }
         }
 
-        /* 以约 1 ms 为单位更新电机短脉冲和视觉数据看门狗。 */
+        trajectory_tick_1ms();
         motor_control_tick_1ms();
-        motor_delay_us(1000);
+        motor_delay_us(1000U);
     }
 }
+
+
 
 
 
