@@ -20,13 +20,21 @@
 #define K230_RIGHT_EDGE_OFFSET_PIXELS    (319)
 #define BALL_POSITION_SCALE              (100)   /* 100 = 1.00 位置单位 */
 #define BALL_POSITION_LIMIT             (1250)  /* 12.50 * 100 */
-#define BALL_POSITION_DEADBAND            (10)  /* Stop inside +/-0.10 cm of the center. */
-#define BALL_RESTART_DEADBAND             (16)  /* Restart beyond +/-0.16 cm. */
+#define BALL_POSITION_DEADBAND            (6)  /* Stop inside +/-0.10 cm of the center. */
+#define BALL_RESTART_DEADBAND             (10)  /* Restart beyond +/-0.16 cm. */
 #define BALL_TARGET_SLOW_ZONE            (200)  /* Slow down within 2.00 cm of balance */
 #define BALL_MIN_CONFIDENCE               (35)  /* K230 score: 0..100 */
 
 /* 自动轨迹：O(0 cm) -> +5 cm -> -5 cm，最终稳定在 -5 cm 附近。 */
 #define TRAJECTORY_ORIGIN_POSITION          (0)
+#define TRAJECTORY_PLUS_POSITION          (500)  /* +5.00 cm */
+#define TRAJECTORY_START_TOLERANCE         (30)  /* Start only from O +/- 0.30 cm. */
+#define TRAJECTORY_TARGET_TOLERANCE        (50)  /* Stop target within +/- 0.50 cm. */
+#define TRAJECTORY_APPROACH_ZONE          (120)  /* Brake during final 1.20 cm. */
+#define TRAJECTORY_APPROACH_PULSE_MS       (20)
+#define TRAJECTORY_START_CONFIRM_FRAMES      (3)
+#define TRAJECTORY_FINAL_CONFIRM_FRAMES      (5)
+#define TRAJECTORY_TIMEOUT_MS             (4800)
 /*
  * 参考轨迹采用“限速 + 跟随窗口”而非直接跳变：
  * - 每个新视觉帧设定值最多前进 0.12 cm；
@@ -94,6 +102,21 @@ typedef struct {
     uint8_t center_hold;
 } BallPidController;
 
+typedef enum {
+    TRAJECTORY_WAIT_AT_ORIGIN = 0,
+    TRAJECTORY_MOVE_TO_PLUS,
+    TRAJECTORY_MOVE_TO_ORIGIN,
+    TRAJECTORY_HOLD_AT_ORIGIN,
+    TRAJECTORY_DONE,
+    TRAJECTORY_TIMEOUT
+} TrajectoryState;
+
+typedef struct {
+    TrajectoryState state;
+    uint16_t elapsed_ms;
+    uint8_t confirm_frames;
+} TrajectoryController;
+
 
 static MotorState g_motor_state = MOTOR_STATE_UNKNOWN;
 static uint8_t g_last_direction = MOTOR_DIRECTION_RAISE;
@@ -107,6 +130,7 @@ static uint8_t g_pending_direction = MOTOR_DIRECTION_RAISE;
 static uint16_t g_pending_speed_rpm = 0U;
 static uint16_t g_pending_pulse_ms = 0U;
 static BallPidController g_pid = {0};
+static TrajectoryController g_trajectory = { TRAJECTORY_WAIT_AT_ORIGIN, 0U, 0U };
 
 static int clamp_int(int value, int min_value, int max_value)
 {
@@ -415,6 +439,81 @@ static void motor_control_tick_1ms(void)
     motor_start_pending_command();
 }
 
+static int task_trajectory_target_position(void)
+{
+    if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
+        return TRAJECTORY_PLUS_POSITION;
+    }
+    if ((g_trajectory.state == TRAJECTORY_MOVE_TO_ORIGIN) ||
+        (g_trajectory.state == TRAJECTORY_HOLD_AT_ORIGIN) ||
+        (g_trajectory.state == TRAJECTORY_DONE)) {
+        return TRAJECTORY_ORIGIN_POSITION;
+    }
+    return TRAJECTORY_ORIGIN_POSITION;
+}
+
+static void task_trajectory_update_on_measurement(int position)
+{
+    int target = task_trajectory_target_position();
+    uint8_t required_frames = TRAJECTORY_FINAL_CONFIRM_FRAMES;
+
+    if ((g_trajectory.state == TRAJECTORY_DONE) ||
+        (g_trajectory.state == TRAJECTORY_TIMEOUT)) {
+        return;
+    }
+
+    if (g_trajectory.state == TRAJECTORY_WAIT_AT_ORIGIN) {
+        target = TRAJECTORY_ORIGIN_POSITION;
+        required_frames = TRAJECTORY_START_CONFIRM_FRAMES;
+    }
+
+    if (abs_int(position - target) >
+        ((g_trajectory.state == TRAJECTORY_WAIT_AT_ORIGIN) ?
+         TRAJECTORY_START_TOLERANCE : TRAJECTORY_TARGET_TOLERANCE)) {
+        g_trajectory.confirm_frames = 0U;
+        return;
+    }
+
+    if (g_trajectory.confirm_frames < required_frames) {
+        g_trajectory.confirm_frames++;
+    }
+    if (g_trajectory.confirm_frames < required_frames) {
+        return;
+    }
+
+    g_trajectory.confirm_frames = 0U;
+    ball_pid_reset();
+    if (g_trajectory.state == TRAJECTORY_WAIT_AT_ORIGIN) {
+        g_trajectory.state = TRAJECTORY_MOVE_TO_PLUS;
+        g_trajectory.elapsed_ms = 0U;
+    } else if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
+        g_trajectory.state = TRAJECTORY_MOVE_TO_ORIGIN;
+    } else if (g_trajectory.state == TRAJECTORY_MOVE_TO_ORIGIN) {
+        g_trajectory.state = TRAJECTORY_HOLD_AT_ORIGIN;
+    } else if (g_trajectory.state == TRAJECTORY_HOLD_AT_ORIGIN) {
+        g_trajectory.state = TRAJECTORY_DONE;
+    }
+}
+
+static void task_trajectory_tick_1ms(void)
+{
+    if ((g_trajectory.state != TRAJECTORY_MOVE_TO_PLUS) &&
+        (g_trajectory.state != TRAJECTORY_MOVE_TO_ORIGIN) &&
+        (g_trajectory.state != TRAJECTORY_HOLD_AT_ORIGIN)) {
+        return;
+    }
+
+    if (g_trajectory.elapsed_ms < TRAJECTORY_TIMEOUT_MS) {
+        g_trajectory.elapsed_ms++;
+    }
+    if (g_trajectory.elapsed_ms >= TRAJECTORY_TIMEOUT_MS) {
+        g_trajectory.state = TRAJECTORY_TIMEOUT;
+        ball_pid_reset();
+        motor_cancel_pending_command();
+        motor_stop();
+    }
+}
+
 static void motor_can_init(void)
 {
     uint16_t elapsed_ms;
@@ -621,6 +720,10 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
     direction = motor_direction_from_pid_command(command);
     abs_error = abs_int(position - target_position);
     pulse_ms = calculate_pulse_ms(abs_int(command), abs_error);
+    if (abs_error <= TRAJECTORY_APPROACH_ZONE) {
+        pulse_ms = (pulse_ms > TRAJECTORY_APPROACH_PULSE_MS) ?
+            TRAJECTORY_APPROACH_PULSE_MS : pulse_ms;
+    }
 
     if (g_motor_state == MOTOR_STATE_RUNNING) {
         if (direction != g_last_direction) {
