@@ -20,16 +20,19 @@
 #define BALL_POSITION_LIMIT             (1250)  /* 12.50 * 100 */
 #define BALL_POSITION_DEADBAND            (20)  /* Hold inside +/-0.20 cm of target. */
 #define BALL_RESTART_DEADBAND             (30)  /* Correct again beyond +/-0.30 cm. */
-#define BALL_VELOCITY_HOLD_DEADBAND         (3)  /* Hold below 0.03 cm per 20 ms. */
-#define BALL_VELOCITY_RESTART_DEADBAND      (5)  /* Brake again above 0.05 cm per 20 ms. */
+#define BALL_BALANCE_POSITION_DEADBAND    (50)  /* Hold inside +/-0.50 cm at -5 cm. */
+#define BALL_BALANCE_RESTART_DEADBAND     (70)  /* Correct again beyond +/-0.70 cm. */
+#define BALL_VELOCITY_HOLD_DEADBAND         (0)  /* Hold only after measured motion reaches zero. */
 #define BALL_MIN_CONFIDENCE               (35)  /* K230 score: 0..100 */
 
 /* 自动轨迹：O(0 cm) -> +5 cm -> -5 cm，最终稳定在 -5 cm 附近。 */
 #define TRAJECTORY_ORIGIN_POSITION          (0)
 #define TRAJECTORY_PLUS_POSITION          (500)  /* +5.00 cm */
 #define TRAJECTORY_MINUS_POSITION        (-500)  /* -5.00 cm */
+#define TRAJECTORY_PLUS_BRAKE_POSITION    (150)  /* Begin braking at +1.50 cm. */
+#define TRAJECTORY_PLUS_TURN_POSITION     (350)  /* Turn toward -5.00 cm at +3.50 cm. */
+#define TRAJECTORY_MINUS_BALANCE_POSITION (-350) /* Begin balancing at -3.50 cm. */
 #define TRAJECTORY_FINAL_CONFIRM_FRAMES      (5)
-#define TRAJECTORY_BUTTON_DEBOUNCE_MS       (30)
 /*
  * 按键后目标直接设为 +5 cm，到位后直接切换为 -5 cm。
  * 全程使用同一个 PD 闭环；到达 -5 cm 后持续保持该目标。
@@ -39,11 +42,16 @@
  * 位置-速度 PD：command = Kp * (target-position) - Kd * velocity。
  * velocity 统一换算为每 20 ms 的位移，避免视觉帧间隔变化直接改变 D 项。
  */
-#define PD_POSITION_KP_NUM                 (5)  /* Kp = 0.18 */
-#define PD_VELOCITY_KD_NUM                (100)  /* Kd = 1.00 */
-#define PD_GAIN_DEN                       (180)
+#define PD_DRIVE_KP_NUM                    (1)  /* Kp = 0.01 */
+#define PD_DRIVE_KD_NUM                    (400)  /* Kd = 4.00 */
+#define PD_BALANCE_KP_NUM                   (8)  /* Kp = 0.08 */
+#define PD_BALANCE_KD_NUM                 (220)  /* Kd = 2.20 */
+#define PD_FINAL_KP_NUM                     (8)  /* Kp = 0.08 */
+#define PD_FINAL_KD_NUM                   (120)  /* Kd = 1.20 */
+#define PD_GAIN_DEN                       (100)
 #define PD_VELOCITY_TIME_BASE_MS           (20)
-#define PD_VELOCITY_DEADBAND                (5)
+#define PD_VELOCITY_DEADBAND                (1)
+#define PD_BALANCE_VELOCITY_DEADBAND        (2)
 #define PD_FRAME_INTERVAL_MAX_MS          (100)
 #define PD_OUTPUT_LIMIT                   (300)
 #define PD_OUTPUT_MIN                       (2)
@@ -67,6 +75,13 @@
 #define MOTOR_MAX_SPEED_RPM               (32)
 #define MOTOR_PULSE_MIN_MS                (20)
 #define MOTOR_PULSE_MAX_MS                (45)
+#define MOTOR_BALANCE_MIN_SPEED_RPM       (10)
+#define MOTOR_BALANCE_MAX_SPEED_RPM       (24)
+#define MOTOR_BALANCE_PULSE_MIN_MS        (10)
+#define MOTOR_BALANCE_PULSE_MAX_MS        (28)
+#define MOTOR_POWER_ON_RAISE_SPEED_RPM    (14)
+#define MOTOR_POWER_ON_RAISE_MS           (20)
+#define MOTOR_POWER_ON_RAISE_EFFORT       (30)
 #define MOTOR_PULSE_GAP_MS                 (3)
 #define MOTOR_DIRECTION_SETTLE_MS          (5)  /* Stop briefly before a reversal. */
 #define MOTOR_CAN_TX_TIMEOUT_MS           (10)
@@ -90,8 +105,10 @@ typedef struct {
 
 typedef enum {
     TRAJECTORY_WAIT_AT_ORIGIN = 0,
-    TRAJECTORY_MOVE_TO_PLUS,
-    TRAJECTORY_MOVE_TO_MINUS,
+    TRAJECTORY_FORCE_RAISE_TO_PLUS,
+    TRAJECTORY_BRAKE_AT_PLUS,
+    TRAJECTORY_DRIVE_TO_MINUS,
+    TRAJECTORY_BALANCE_AT_MINUS,
     TRAJECTORY_HOLD_AT_MINUS
 } TrajectoryState;
 
@@ -113,8 +130,6 @@ static uint8_t g_pending_direction = MOTOR_DIRECTION_RAISE;
 static uint16_t g_pending_speed_rpm = 0U;
 static uint16_t g_pending_pulse_ms = 0U;
 static BallPdController g_pd = {0};
-static uint8_t g_button_was_pressed = 0U;
-static uint16_t g_button_debounce_ms = 0U;
 static TrajectoryController g_trajectory = {
     TRAJECTORY_WAIT_AT_ORIGIN, 0U
 };
@@ -164,19 +179,21 @@ static void ball_pd_reset(void)
  *   负数 => 小球在中心右侧（x>0）=> 降低水管。
  */
 static int ball_pd_update(int raw_position, int target_position,
-                          uint16_t frame_interval_ms)
+                          uint16_t frame_interval_ms,
+                          int position_kp_num, int velocity_kd_num,
+                          uint8_t fine_control)
 {
     int error;
     int velocity;
     int command;
+    int hold_deadband;
+    int restart_deadband;
     int32_t numerator;
 
     raw_position = clamp_int(raw_position, -BALL_POSITION_LIMIT,
                              BALL_POSITION_LIMIT);
 
-    if ((g_pd.valid == 0U) ||
-        (g_pd.target_position != target_position) ||
-        (frame_interval_ms == 0U) ||
+    if ((g_pd.valid == 0U) || (frame_interval_ms == 0U) ||
         (frame_interval_ms > PD_FRAME_INTERVAL_MAX_MS)) {
         velocity = 0;
     } else {
@@ -184,31 +201,38 @@ static int ball_pd_update(int raw_position, int target_position,
                     PD_VELOCITY_TIME_BASE_MS) /
                    (int)frame_interval_ms;
     }
-    if (abs_int(velocity) <= PD_VELOCITY_DEADBAND) {
+    if (abs_int(velocity) <= ((fine_control != 0U) ?
+        PD_BALANCE_VELOCITY_DEADBAND : PD_VELOCITY_DEADBAND)) {
         velocity = 0;
+    }
+    if (g_pd.target_position != target_position) {
+        g_pd.target_hold = 0U;
     }
     g_pd.previous_position = raw_position;
     g_pd.target_position = target_position;
     g_pd.valid = 1U;
 
     error = target_position - raw_position;
+    hold_deadband = (fine_control != 0U) ?
+        BALL_BALANCE_POSITION_DEADBAND : BALL_POSITION_DEADBAND;
+    restart_deadband = (fine_control != 0U) ?
+        BALL_BALANCE_RESTART_DEADBAND : BALL_RESTART_DEADBAND;
 
     if (g_pd.target_hold != 0U) {
-        if ((abs_int(error) <= BALL_RESTART_DEADBAND) &&
-            (abs_int(velocity) <= BALL_VELOCITY_RESTART_DEADBAND)) {
+        if ((abs_int(error) <= restart_deadband) && (velocity == 0)) {
             return 0;
         }
         g_pd.target_hold = 0U;
     }
 
-    if ((abs_int(error) <= BALL_POSITION_DEADBAND) &&
+    if ((abs_int(error) <= hold_deadband) &&
         (abs_int(velocity) <= BALL_VELOCITY_HOLD_DEADBAND)) {
         g_pd.target_hold = 1U;
         return 0;
     }
 
-    numerator = ((int32_t)PD_POSITION_KP_NUM * error) -
-                ((int32_t)PD_VELOCITY_KD_NUM * velocity);
+    numerator = ((int32_t)position_kp_num * error) -
+                ((int32_t)velocity_kd_num * velocity);
     command = (int)(numerator / PD_GAIN_DEN);
     command = clamp_int(command, -PD_OUTPUT_LIMIT, PD_OUTPUT_LIMIT);
 
@@ -219,30 +243,36 @@ static int ball_pd_update(int raw_position, int target_position,
 }
 
 /* PD 输出绝对值同时决定 CAN 速度和本次速度命令的持续时间。 */
-static uint16_t calculate_speed_rpm(int effort)
+static uint16_t calculate_speed_rpm(int effort, uint8_t fine_control)
 {
-    int speed_range = MOTOR_MAX_SPEED_RPM - MOTOR_MIN_SPEED_RPM;
+    int min_speed = (fine_control != 0U) ?
+        MOTOR_BALANCE_MIN_SPEED_RPM : MOTOR_MIN_SPEED_RPM;
+    int max_speed = (fine_control != 0U) ?
+        MOTOR_BALANCE_MAX_SPEED_RPM : MOTOR_MAX_SPEED_RPM;
+    int speed_range = max_speed - min_speed;
     int full_speed;
 
     effort = clamp_int(effort, PD_OUTPUT_MIN, MOTOR_FULL_EFFORT);
-    full_speed = MOTOR_MIN_SPEED_RPM +
+    full_speed = min_speed +
         ((effort - PD_OUTPUT_MIN) * speed_range) /
         (MOTOR_FULL_EFFORT - PD_OUTPUT_MIN);
-    return (uint16_t)clamp_int(full_speed, MOTOR_MIN_SPEED_RPM,
-                               MOTOR_MAX_SPEED_RPM);
+    return (uint16_t)clamp_int(full_speed, min_speed, max_speed);
 }
 
-static uint16_t calculate_pulse_ms(int effort)
+static uint16_t calculate_pulse_ms(int effort, uint8_t fine_control)
 {
-    int pulse_range = MOTOR_PULSE_MAX_MS - MOTOR_PULSE_MIN_MS;
+    int min_pulse = (fine_control != 0U) ?
+        MOTOR_BALANCE_PULSE_MIN_MS : MOTOR_PULSE_MIN_MS;
+    int max_pulse = (fine_control != 0U) ?
+        MOTOR_BALANCE_PULSE_MAX_MS : MOTOR_PULSE_MAX_MS;
+    int pulse_range = max_pulse - min_pulse;
     int full_pulse;
 
     effort = clamp_int(effort, PD_OUTPUT_MIN, MOTOR_FULL_EFFORT);
-    full_pulse = MOTOR_PULSE_MIN_MS +
+    full_pulse = min_pulse +
         ((effort - PD_OUTPUT_MIN) * pulse_range) /
         (MOTOR_FULL_EFFORT - PD_OUTPUT_MIN);
-    return (uint16_t)clamp_int(full_pulse, MOTOR_PULSE_MIN_MS,
-                               MOTOR_PULSE_MAX_MS);
+    return (uint16_t)clamp_int(full_pulse, min_pulse, max_pulse);
 }
 
 /* 近似延时，仅用于 CAN 请求等待与主循环约 1 ms 节拍。 */
@@ -390,87 +420,103 @@ static void motor_control_tick_1ms(void)
     motor_start_pending_command();
 }
 
+static void motor_power_on_raise(void)
+{
+    uint16_t elapsed_ms;
+
+    if (motor_set_speed(MOTOR_DIRECTION_RAISE,
+                        MOTOR_POWER_ON_RAISE_SPEED_RPM) == 0U) {
+        return;
+    }
+
+    g_motor_state = MOTOR_STATE_RUNNING;
+    g_last_direction = MOTOR_DIRECTION_RAISE;
+    g_active_speed_rpm = MOTOR_POWER_ON_RAISE_SPEED_RPM;
+    for (elapsed_ms = 0U; elapsed_ms < MOTOR_POWER_ON_RAISE_MS; elapsed_ms++) {
+        motor_delay_us(1000U);
+    }
+    motor_stop();
+}
+
 static int task_trajectory_target_position(void)
 {
-    if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
+    if ((g_trajectory.state == TRAJECTORY_FORCE_RAISE_TO_PLUS) ||
+        (g_trajectory.state == TRAJECTORY_BRAKE_AT_PLUS)) {
         return TRAJECTORY_PLUS_POSITION;
     }
-    if ((g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) ||
+    if ((g_trajectory.state == TRAJECTORY_DRIVE_TO_MINUS) ||
+        (g_trajectory.state == TRAJECTORY_BALANCE_AT_MINUS) ||
         (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS)) {
         return TRAJECTORY_MINUS_POSITION;
     }
     return TRAJECTORY_ORIGIN_POSITION;
 }
 
-static void task_trajectory_update_on_measurement(void)
+static uint8_t task_trajectory_uses_drive_pd(void)
 {
-    uint8_t required_frames;
+    return ((g_trajectory.state == TRAJECTORY_FORCE_RAISE_TO_PLUS) ||
+            (g_trajectory.state == TRAJECTORY_DRIVE_TO_MINUS)) ? 1U : 0U;
+}
 
-    if (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS) {
-        return;
+static void task_trajectory_update_on_measurement(int position)
+{
+    switch (g_trajectory.state) {
+        case TRAJECTORY_FORCE_RAISE_TO_PLUS:
+            if (position >= TRAJECTORY_PLUS_BRAKE_POSITION) {
+                g_trajectory.state = TRAJECTORY_BRAKE_AT_PLUS;
+            }
+            break;
+
+        case TRAJECTORY_BRAKE_AT_PLUS:
+            if (position >= TRAJECTORY_PLUS_TURN_POSITION) {
+                g_trajectory.state = TRAJECTORY_DRIVE_TO_MINUS;
+                g_trajectory.confirm_frames = 0U;
+                g_pd.target_hold = 0U;
+            }
+            break;
+
+        case TRAJECTORY_DRIVE_TO_MINUS:
+            if (position <= TRAJECTORY_MINUS_BALANCE_POSITION) {
+                g_trajectory.state = TRAJECTORY_BALANCE_AT_MINUS;
+                g_trajectory.confirm_frames = 0U;
+            }
+            break;
+
+        default:
+            break;
     }
+}
 
-    if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
-        required_frames = 1U;
-    } else if (g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) {
-        required_frames = TRAJECTORY_FINAL_CONFIRM_FRAMES;
-    } else {
+static void task_trajectory_confirm_final_position(void)
+{
+    if (g_trajectory.state != TRAJECTORY_BALANCE_AT_MINUS) {
         return;
     }
     if (g_pd.target_hold == 0U) {
         g_trajectory.confirm_frames = 0U;
         return;
     }
-
-    if (g_trajectory.confirm_frames < required_frames) {
+    if (g_trajectory.confirm_frames < TRAJECTORY_FINAL_CONFIRM_FRAMES) {
         g_trajectory.confirm_frames++;
     }
-    if (g_trajectory.confirm_frames < required_frames) {
-        return;
-    }
-
-    g_trajectory.confirm_frames = 0U;
-    ball_pd_reset();
-    if (g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) {
-        g_trajectory.state = TRAJECTORY_MOVE_TO_MINUS;
-    } else if (g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) {
+    if (g_trajectory.confirm_frames >= TRAJECTORY_FINAL_CONFIRM_FRAMES) {
         g_trajectory.state = TRAJECTORY_HOLD_AT_MINUS;
         DL_GPIO_clearPins(LED1_PORT, LED1_PIN_2_PIN);
     }
 }
 
-static uint8_t trajectory_start_button_pressed(void)
-{
-    uint8_t pressed = (DL_GPIO_readPins(KEY_PORT, KEY_PIN_0_PIN) == 0U) ?
-        1U : 0U;
-
-    if (g_button_debounce_ms > 0U) {
-        g_button_debounce_ms--;
-        return 0U;
-    }
-
-    if ((pressed != 0U) && (g_button_was_pressed == 0U)) {
-        g_button_was_pressed = 1U;
-        g_button_debounce_ms = TRAJECTORY_BUTTON_DEBOUNCE_MS;
-        return 1U;
-    }
-
-    if (pressed == 0U) {
-        g_button_was_pressed = 0U;
-    }
-    return 0U;
-}
-
 static uint8_t task_trajectory_is_active(void)
 {
-    return ((g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) ||
-            (g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) ||
+    return ((g_trajectory.state == TRAJECTORY_FORCE_RAISE_TO_PLUS) ||
+            (g_trajectory.state == TRAJECTORY_BRAKE_AT_PLUS) ||
+            (g_trajectory.state == TRAJECTORY_DRIVE_TO_MINUS) ||
+            (g_trajectory.state == TRAJECTORY_BALANCE_AT_MINUS) ||
             (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS)) ? 1U : 0U;
 }
 
 static void task_trajectory_start(void)
 {
-    g_trajectory.state = TRAJECTORY_MOVE_TO_PLUS;
+    g_trajectory.state = TRAJECTORY_FORCE_RAISE_TO_PLUS;
     g_trajectory.confirm_frames = 0U;
     ball_pd_reset();
     motor_cancel_pending_command();
@@ -499,10 +545,12 @@ static uint8_t motor_direction_from_pd_command(int command)
 
 /* 每个有效新帧调用一次。target_position 可为 O、+5 cm 或 -5 cm。 */
 static void motor_track_ball(const BallInfo *ball, int target_position,
-                             uint16_t frame_interval_ms)
+                             uint16_t frame_interval_ms,
+                             uint8_t use_drive_pd)
 {
     int position;
     int command;
+    uint8_t fine_control;
     uint8_t direction;
     uint16_t pulse_ms;
     uint16_t speed_rpm;
@@ -515,7 +563,23 @@ static void motor_track_ball(const BallInfo *ball, int target_position,
     }
 
     position = ball_x_pixels_to_position(ball->cx);
-    command = ball_pd_update(position, target_position, frame_interval_ms);
+    fine_control = ((g_trajectory.state == TRAJECTORY_BALANCE_AT_MINUS) ||
+                    (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS)) ?
+                   1U : 0U;
+    command = ball_pd_update(
+        position, target_position, frame_interval_ms,
+        (fine_control != 0U) ? PD_FINAL_KP_NUM :
+            ((use_drive_pd != 0U) ? PD_DRIVE_KP_NUM : PD_BALANCE_KP_NUM),
+        (fine_control != 0U) ? PD_FINAL_KD_NUM :
+            ((use_drive_pd != 0U) ? PD_DRIVE_KD_NUM : PD_BALANCE_KD_NUM),
+        fine_control);
+    if (g_trajectory.state == TRAJECTORY_FORCE_RAISE_TO_PLUS) {
+        command = MOTOR_POWER_ON_RAISE_EFFORT;
+    }
+    if ((g_trajectory.state == TRAJECTORY_DRIVE_TO_MINUS) &&
+        (command > 0)) {
+        command = 0;
+    }
     if (command == 0) {
         motor_cancel_pending_command();
         motor_stop();
@@ -523,8 +587,8 @@ static void motor_track_ball(const BallInfo *ball, int target_position,
     }
 
     direction = motor_direction_from_pd_command(command);
-    speed_rpm = calculate_speed_rpm(abs_int(command));
-    pulse_ms = calculate_pulse_ms(abs_int(command));
+    speed_rpm = calculate_speed_rpm(abs_int(command), fine_control);
+    pulse_ms = calculate_pulse_ms(abs_int(command), fine_control);
 
     if (g_motor_state == MOTOR_STATE_RUNNING) {
         if (direction != g_last_direction) {
@@ -598,13 +662,10 @@ int main(void)
     SYSCFG_DL_init();
     uart2_init();
     motor_can_init();
+    task_trajectory_start();
+    motor_power_on_raise();
 
     while (1) {
-        if ((task_trajectory_is_active() == 0U) &&
-            (trajectory_start_button_pressed() != 0U)) {
-            task_trajectory_start();
-        }
-
         ball_state = take_latest_ball(&ball);
         if (ball_state == 1U) {
             frame_interval_ms = vision_silence_ms;
@@ -612,11 +673,14 @@ int main(void)
                 frame_interval_ms = 1U;
             }
             vision_silence_ms = 0U;
-            motor_track_ball(&ball, task_trajectory_target_position(),
-                             frame_interval_ms);
             if (task_trajectory_is_active() != 0U) {
-                task_trajectory_update_on_measurement();
+                task_trajectory_update_on_measurement(
+                    ball_x_pixels_to_position(ball.cx));
             }
+            motor_track_ball(&ball, task_trajectory_target_position(),
+                             frame_interval_ms,
+                             task_trajectory_uses_drive_pd());
+            task_trajectory_confirm_final_position();
         } else if (ball_state == 2U) {
             vision_silence_ms = 0U;
             ball_pd_reset();
