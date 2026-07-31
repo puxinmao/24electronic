@@ -20,6 +20,9 @@
 #define BALL_POSITION_SCALE              (100)   /* 100 = 1.00 位置单位 */
 #define BALL_POSITION_LIMIT             (1250)  /* 12.50 * 100 */
 #define BALL_POSITION_DEADBAND             (8)  /* 平衡点 +/-0.08 cm 内不动作（约 2 像素） */
+#undef BALL_POSITION_DEADBAND
+#define BALL_POSITION_DEADBAND            (15)  /* Stop inside +/-0.15 cm of the center. */
+#define BALL_RESTART_DEADBAND             (25)  /* Leave center hold only beyond +/-0.25 cm. */
 #define BALL_BRAKE_ZONE                   (90)  /* Base predictive braking zone: 0.90 cm */
 #define BALL_PREDICTIVE_BRAKE_GAIN          (4)  /* Extra braking zone per frame displacement */
 #define BALL_BRAKE_ZONE_MAX              (220)  /* Fast-approach braking limit: 2.20 cm */
@@ -61,6 +64,10 @@
 #define PID_GAIN_DEN                      (100)
 #define PID_INTEGRAL_LIMIT              (6000)
 #define PID_OUTPUT_LIMIT                (1250)
+#define VELOCITY_BRAKE_DELTA              (20)  /* 0.80 cm per frame toward the center. */
+#define VELOCITY_BRAKE_CONFIRM_FRAMES       (1)
+#define PID_VELOCITY_BRAKE_OUTPUT         (700)
+#define VELOCITY_BRAKE_SETTLE_MS            (5)
 #define PID_OUTPUT_MIN                    (50)  /* 最小有效纠正量，0.50 */
 
 /* Emm_V5 / ZDT_X CAN1_MAP 参数；须与电机内部设置相同。 */
@@ -81,19 +88,22 @@
 #define MOTOR_MIN_SPEED_RPM                (5)
 #define MOTOR_CRUISE_SPEED_RPM             (6)  /* Faster correction away from balance */
 #define MOTOR_MAX_SPEED_RPM                (7)
-#define MOTOR_PULSE_MIN_MS                (50)  /* Keep a correction active between normal camera frames. */
-#define MOTOR_CRUISE_PULSE_MS             (70)
-#define MOTOR_PULSE_MAX_MS                (90)
-#define MOTOR_PULSE_GAP_MS                 (0)  /* New measurements refresh the pulse instead of forcing a stop. */
-#define ACTUATOR_RAISE_LIMIT_RPM_MS       (MOTOR_CRUISE_SPEED_RPM * 120)
-#define ACTUATOR_LOWER_LIMIT_RPM_MS       (MOTOR_CRUISE_SPEED_RPM * 120)
-#define MOTOR_DIRECTION_SETTLE_MS         (10)  /* Fast correction after a confirmed center crossing */
+#define MOTOR_PULSE_MIN_MS                (25)
+#define MOTOR_CRUISE_PULSE_MS             (40)
+#define MOTOR_PULSE_MAX_MS                (55)
+#define MOTOR_PULSE_GAP_MS                (10)
+#define MOTOR_RETURN_SETTLE_MS             (5)
+#define MOTOR_AUTO_RETURN_TO_BALANCE       (0)
+#define ACTUATOR_RAISE_LIMIT_RPM_MS       (MOTOR_CRUISE_SPEED_RPM * 200)
+#define ACTUATOR_LOWER_LIMIT_RPM_MS       (MOTOR_CRUISE_SPEED_RPM * 200)
+#define MOTOR_DIRECTION_SETTLE_MS         (40)  /* Let the mechanism settle before a reversal. */
 #define MOTOR_CAN_TX_TIMEOUT_MS           (10)
 #define VISION_LOST_TIMEOUT_MS           (300)
 #define VISION_FRAME_LOSS_CONFIRM_MS       (80)  /* No UART frame for this long is treated as a dropped vision stream. */
 #define VISION_LOST_LEFT_DELTA              (4)  /* 0.04 cm leftward movement between two valid frames. */
 #define VISION_LOST_CONTINUE_SPEED_RPM       (6)
 #define VISION_LOST_CONTINUE_PULSE_MS      (100)
+#define MOTION_FEEDBACK_DELTA               (8)  /* 0.08 cm change from the preceding frame. */
 
 #define MOTOR_CAN_EXT_ID          ((uint32_t)MOTOR_ID << 8U)
 #define MOTOR_CAN_TX_BUFFER                 (0U)
@@ -112,6 +122,9 @@ typedef struct {
     int integral;
     uint8_t valid;
     uint8_t crossed_target;
+    uint8_t center_hold;
+    uint8_t toward_center_frames;
+    uint8_t velocity_braking;
 } BallPidController;
 
 typedef enum {
@@ -138,6 +151,12 @@ static uint16_t g_motor_pulse_ms_left = 0U;
 static uint16_t g_motor_pulse_gap_ms_left = 0U;
 static uint16_t g_active_speed_rpm = 0U;
 static int32_t g_actuator_offset_rpm_ms = 0;
+static uint8_t g_return_to_balance_pending = 0U;
+static uint8_t g_returning_to_balance = 0U;
+static uint8_t g_return_after_pulse = 0U;
+static int g_previous_motion_position = 0;
+static uint8_t g_motion_position_valid = 0U;
+static uint8_t g_motion_feedback_active = 0U;
 static BallPidController g_pid = {0};
 static TrajectoryController g_trajectory = { TRAJECTORY_WAIT_AT_ORIGIN, 0U, 0U, TRAJECTORY_ORIGIN_POSITION };
 static int g_previous_ball_position = 0;
@@ -208,6 +227,35 @@ static void ball_pid_reset(void)
     g_pid.integral = 0;
     g_pid.valid = 0U;
     g_pid.crossed_target = 0U;
+    g_pid.center_hold = 0U;
+    g_pid.toward_center_frames = 0U;
+    g_pid.velocity_braking = 0U;
+    g_motion_position_valid = 0U;
+    g_motion_feedback_active = 0U;
+}
+
+static int apply_motion_feedback(int position, int fallback_command)
+{
+    int position_delta;
+
+    g_motion_feedback_active = 0U;
+    if (g_motion_position_valid == 0U) {
+        g_previous_motion_position = position;
+        g_motion_position_valid = 1U;
+        return fallback_command;
+    }
+
+    position_delta = position - g_previous_motion_position;
+    g_previous_motion_position = position;
+    if (position_delta >= MOTION_FEEDBACK_DELTA) {
+        g_motion_feedback_active = 1U;
+        return -PID_VELOCITY_BRAKE_OUTPUT;
+    }
+    if (position_delta <= -MOTION_FEEDBACK_DELTA) {
+        g_motion_feedback_active = 1U;
+        return PID_VELOCITY_BRAKE_OUTPUT;
+    }
+    return fallback_command;
 }
 
 /*
@@ -230,6 +278,7 @@ static int ball_pid_update(int raw_position, int target_position)
                              BALL_POSITION_LIMIT);
     raw_error = target_position - raw_position;
     g_pid.crossed_target = 0U;
+    g_pid.velocity_braking = 0U;
 
     if (g_pid.valid == 0U) {
         g_pid.filtered_position = raw_position;
@@ -262,11 +311,41 @@ static int ball_pid_update(int raw_position, int target_position)
     error = target_position - g_pid.filtered_position;
     derivative = error - g_pid.previous_error;
 
+    if (g_pid.center_hold != 0U) {
+        if (abs_int(error) <= BALL_RESTART_DEADBAND) {
+            g_pid.integral = 0;
+            g_pid.previous_error = error;
+            g_pid.previous_raw_error = raw_error;
+            return 0;
+        }
+        g_pid.center_hold = 0U;
+    }
+
     if (abs_int(error) <= BALL_POSITION_DEADBAND) {
-        g_pid.integral = (g_pid.integral * 3) / 4;
+        g_pid.center_hold = 1U;
+        g_pid.integral = 0;
+        g_pid.toward_center_frames = 0U;
         g_pid.previous_error = error;
         g_pid.previous_raw_error = raw_error;
         return 0;
+    }
+
+    if (((error > 0) && (position_delta >= VELOCITY_BRAKE_DELTA)) ||
+        ((error < 0) && (position_delta <= -VELOCITY_BRAKE_DELTA))) {
+        if (g_pid.toward_center_frames < VELOCITY_BRAKE_CONFIRM_FRAMES) {
+            g_pid.toward_center_frames++;
+        }
+    } else {
+        g_pid.toward_center_frames = 0U;
+    }
+
+    if (g_pid.toward_center_frames >= VELOCITY_BRAKE_CONFIRM_FRAMES) {
+        g_pid.integral = 0;
+        g_pid.velocity_braking = 1U;
+        g_pid.previous_error = error;
+        g_pid.previous_raw_error = raw_error;
+        return (error > 0) ? -PID_VELOCITY_BRAKE_OUTPUT :
+                             PID_VELOCITY_BRAKE_OUTPUT;
     }
 
     /* Expand the no-drive zone when the ball is approaching O quickly. */
@@ -499,18 +578,63 @@ static uint8_t actuator_can_move(uint8_t direction)
     return (g_actuator_offset_rpm_ms > -ACTUATOR_LOWER_LIMIT_RPM_MS) ? 1U : 0U;
 }
 
+static void motor_request_return_to_balance(void)
+{
+    g_return_after_pulse = 0U;
+#if MOTOR_AUTO_RETURN_TO_BALANCE
+    if (g_actuator_offset_rpm_ms != 0) {
+        g_return_to_balance_pending = 1U;
+        g_motor_pulse_gap_ms_left = MOTOR_RETURN_SETTLE_MS;
+    }
+#endif
+}
+
+static void motor_start_return_to_balance(void)
+{
+    uint8_t direction;
+    uint32_t distance;
+    uint16_t pulse_ms;
+
+    if (g_actuator_offset_rpm_ms == 0) {
+        g_return_to_balance_pending = 0U;
+        return;
+    }
+
+    direction = (g_actuator_offset_rpm_ms > 0) ?
+        MOTOR_DIRECTION_LOWER : MOTOR_DIRECTION_RAISE;
+    distance = (g_actuator_offset_rpm_ms > 0) ?
+        (uint32_t)g_actuator_offset_rpm_ms :
+        (uint32_t)(-g_actuator_offset_rpm_ms);
+    pulse_ms = (uint16_t)((distance + MOTOR_CRUISE_SPEED_RPM - 1U) /
+                          MOTOR_CRUISE_SPEED_RPM);
+
+    if (motor_set_speed(direction, MOTOR_CRUISE_SPEED_RPM) != 0U) {
+        g_motor_state = MOTOR_STATE_RUNNING;
+        g_last_direction = direction;
+        g_active_speed_rpm = MOTOR_CRUISE_SPEED_RPM;
+        g_motor_pulse_ms_left = pulse_ms;
+        g_return_to_balance_pending = 0U;
+        g_returning_to_balance = 1U;
+    } else {
+        g_motor_enabled = 0U;
+        g_motor_state = MOTOR_STATE_STOPPED;
+    }
+}
+
 static void motor_control_tick_1ms(void)
 {
     if (g_motor_state == MOTOR_STATE_RUNNING) {
         if (g_last_direction == MOTOR_DIRECTION_RAISE) {
             if (g_actuator_offset_rpm_ms >= ACTUATOR_RAISE_LIMIT_RPM_MS) {
                 motor_stop();
+                motor_request_return_to_balance();
                 return;
             }
             g_actuator_offset_rpm_ms += g_active_speed_rpm;
         } else {
             if (g_actuator_offset_rpm_ms <= -ACTUATOR_LOWER_LIMIT_RPM_MS) {
                 motor_stop();
+                motor_request_return_to_balance();
                 return;
             }
             g_actuator_offset_rpm_ms -= g_active_speed_rpm;
@@ -521,16 +645,32 @@ static void motor_control_tick_1ms(void)
         g_motor_pulse_ms_left--;
         if (g_motor_pulse_ms_left == 0U) {
             motor_stop();
-            g_motor_pulse_gap_ms_left = MOTOR_PULSE_GAP_MS;
+            if (g_returning_to_balance != 0U) {
+                g_actuator_offset_rpm_ms = 0;
+                g_returning_to_balance = 0U;
+                g_motor_pulse_gap_ms_left = MOTOR_PULSE_GAP_MS;
+            } else if (g_return_after_pulse != 0U) {
+                motor_request_return_to_balance();
+            } else {
+                g_motor_pulse_gap_ms_left = MOTOR_PULSE_GAP_MS;
+            }
         }
     } else if (g_motor_pulse_gap_ms_left > 0U) {
         g_motor_pulse_gap_ms_left--;
+    } else if (g_return_to_balance_pending != 0U) {
+        motor_start_return_to_balance();
     }
 }
 
 /* Continue the last confirmed roll direction while vision is temporarily lost. */
 static void motor_continue_in_direction_on_vision_loss(uint8_t direction)
 {
+    if ((g_return_to_balance_pending != 0U) ||
+        (g_returning_to_balance != 0U)) {
+        return;
+    }
+
+    g_return_after_pulse = 0U;
     if (actuator_can_move(direction) == 0U) {
         motor_stop();
         return;
@@ -755,20 +895,30 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
     uint16_t pulse_ms;
     uint16_t speed_rpm;
 
+    if ((g_return_to_balance_pending != 0U) ||
+        (g_returning_to_balance != 0U)) {
+        return;
+    }
+
     if ((ball == 0) || (ball->score < BALL_MIN_CONFIDENCE)) {
         ball_pid_reset();
+        motor_request_return_to_balance();
         motor_stop();
         return;
     }
 
     position = ball_x_pixels_to_position(ball->cx);
     command = ball_pid_update(position, target_position);
-    if (g_pid.crossed_target != 0U) {
-        /* A confirmed raw-position crossing must not wait out the old pulse gap. */
-        g_motor_pulse_gap_ms_left = 0U;
+    command = apply_motion_feedback(position, command);
+    if ((g_pid.crossed_target != 0U) &&
+        (g_motion_feedback_active == 0U)) {
+        motor_stop();
+        motor_request_return_to_balance();
+        return;
     }
     if (command == 0) {
         motor_stop();
+        motor_request_return_to_balance();
         return;
     }
 
@@ -776,6 +926,7 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
     if (actuator_can_move(direction) == 0U) {
         ball_pid_reset();
         motor_stop();
+        motor_request_return_to_balance();
         return;
     }
     abs_error = abs_int(position - target_position);
@@ -785,8 +936,8 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
         if (direction != g_last_direction) {
             /* 方向反转时先刹停；防止水管惯性和 PID 积分共同放大振荡。 */
             motor_stop();
-            g_motor_pulse_gap_ms_left = MOTOR_DIRECTION_SETTLE_MS;
-        } else {
+            motor_request_return_to_balance();
+        } else if (g_motor_pulse_ms_left > pulse_ms) {
             /* 新帧要求更小修正时，仅缩短当前脉冲，绝不延长它。 */
             g_motor_pulse_ms_left = pulse_ms;
         }
@@ -803,6 +954,7 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
         g_last_direction = direction;
         g_active_speed_rpm = speed_rpm;
         g_motor_pulse_ms_left = pulse_ms;
+        g_return_after_pulse = 0U;
     } else {
         g_motor_enabled = 0U;
         g_motor_state = MOTOR_STATE_STOPPED;
