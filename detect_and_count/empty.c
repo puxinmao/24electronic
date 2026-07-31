@@ -20,8 +20,8 @@
 #define K230_RIGHT_EDGE_OFFSET_PIXELS    (319)
 #define BALL_POSITION_SCALE              (100)   /* 100 = 1.00 位置单位 */
 #define BALL_POSITION_LIMIT             (1250)  /* 12.50 * 100 */
-#define BALL_POSITION_DEADBAND            (6)  /* Stop inside +/-0.10 cm of the center. */
-#define BALL_RESTART_DEADBAND             (10)  /* Restart beyond +/-0.16 cm. */
+#define BALL_POSITION_DEADBAND            (12)  /* Hold inside +/-0.12 cm of center. */
+#define BALL_RESTART_DEADBAND             (20)  /* Correct again beyond +/-0.20 cm. */
 #define BALL_TARGET_SLOW_ZONE            (200)  /* Slow down within 2.00 cm of balance */
 #define BALL_MIN_CONFIDENCE               (35)  /* K230 score: 0..100 */
 
@@ -32,6 +32,9 @@
 #define TRAJECTORY_TARGET_TOLERANCE        (50)  /* Stop target within +/- 0.50 cm. */
 #define TRAJECTORY_APPROACH_ZONE          (120)  /* Brake during final 1.20 cm. */
 #define TRAJECTORY_APPROACH_PULSE_MS       (20)
+#define CENTER_CAPTURE_ZONE                (80)  /* Fine control inside 0.80 cm. */
+#define CENTER_CAPTURE_PULSE_MS            (12)
+#define CENTER_CAPTURE_SPEED_RPM            (5)
 #define TRAJECTORY_START_CONFIRM_FRAMES      (3)
 #define TRAJECTORY_FINAL_CONFIRM_FRAMES      (5)
 #define TRAJECTORY_TIMEOUT_MS             (4800)
@@ -50,9 +53,9 @@
  * 初始值偏保守：先保证不明显过冲，再按下方说明逐步调大 Kp / Kd。
  */
 #define PID_FILTER_DIVISOR                (1)   /* Use the current vision frame immediately. */
-#define PID_KP_NUM                         (10) /* Kp = 0.95 */
+#define PID_KP_NUM                         (12) /* Kp = 0.95 */
 #define PID_KI_NUM                          (0) /* Enable only after PD is stable. */
-#define PID_KD_NUM                        (400) /* Kd = 2.40 */
+#define PID_KD_NUM                        (600) /* Kd = 2.40 */
 #define PID_DERIVATIVE_DEADBAND             (8) /* Ignore <= 0.08 cm/frame vision jitter. */
 #define PID_GAIN_DEN                      (100)
 #define PID_INTEGRAL_LIMIT              (3000) /* Limits I contribution to 0.90 command. */
@@ -720,7 +723,9 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
     direction = motor_direction_from_pid_command(command);
     abs_error = abs_int(position - target_position);
     pulse_ms = calculate_pulse_ms(abs_int(command), abs_error);
-    if (abs_error <= TRAJECTORY_APPROACH_ZONE) {
+    if (abs_error <= CENTER_CAPTURE_ZONE) {
+        pulse_ms = CENTER_CAPTURE_PULSE_MS;
+    } else if (abs_error <= TRAJECTORY_APPROACH_ZONE) {
         pulse_ms = (pulse_ms > TRAJECTORY_APPROACH_PULSE_MS) ?
             TRAJECTORY_APPROACH_PULSE_MS : pulse_ms;
     }
@@ -750,6 +755,9 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
     }
 
     speed_rpm = calculate_speed_rpm(abs_int(command), abs_error);
+    if (abs_error <= CENTER_CAPTURE_ZONE) {
+        speed_rpm = CENTER_CAPTURE_SPEED_RPM;
+    }
     if (motor_set_speed(direction, speed_rpm) != 0U) {
         g_motor_state = MOTOR_STATE_RUNNING;
         g_last_direction = direction;
