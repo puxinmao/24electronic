@@ -29,8 +29,8 @@ static uint8_t send_can_frame(uint32_t extended_id,
     }
 
     if ((DL_MCAN_getTxBufReqPend(MCAN0_INST) & buffer_mask) != 0U) {
-        (void)DL_MCAN_txBufCancellationReq(MCAN0_INST,
-                                           ZDT_CAN_TX_BUFFER);
+        /* 上一帧仍在发送时不可取消它，否则会丢失关键的换向/停止命令。 */
+        return 0U;
     }
 
     message.id = extended_id;
@@ -96,7 +96,7 @@ void ZdtMotor_Init(void)
     }
 }
 
-void ZdtMotor_Enable(void)
+uint8_t ZdtMotor_Enable(void)
 {
     const uint8_t command[5] = {
         0xF3U, 0xABU, 0x01U, 0x00U, ZDT_MOTOR_CHECKSUM
@@ -104,22 +104,23 @@ void ZdtMotor_Enable(void)
 
     if (send_command(command, sizeof(command)) != 0U) {
         g_enabled = 1U;
+        return 1U;
     }
+    return 0U;
 }
 
-void ZdtMotor_SetSpeed(ZdtPipeDirection direction, uint16_t speed_rpm)
+uint8_t ZdtMotor_SetSpeed(ZdtPipeDirection direction, uint16_t speed_rpm)
 {
     uint8_t command[7];
 
     if (speed_rpm == 0U) {
-        ZdtMotor_Stop();
-        return;
+        return ZdtMotor_Stop();
     }
     if (g_enabled == 0U) {
-        ZdtMotor_Enable();
+        (void)ZdtMotor_Enable();
     }
     if (g_enabled == 0U) {
-        return;
+        return 0U;
     }
 
     command[0] = 0xF6U;
@@ -133,7 +134,9 @@ void ZdtMotor_SetSpeed(ZdtPipeDirection direction, uint16_t speed_rpm)
 
     if (send_command(command, sizeof(command)) != 0U) {
         g_moving = 1U;
+        return 1U;
     }
+    return 0U;
 }
 
 uint8_t ZdtMotor_IsReady(void)
@@ -141,7 +144,26 @@ uint8_t ZdtMotor_IsReady(void)
     return (g_can_ready != 0U) ? 1U : 0U;
 }
 
-void ZdtMotor_Stop(void)
+void ZdtMotor_GetCanStatus(ZdtCanStatus *status)
+{
+    DL_MCAN_ErrCntStatus error_counters;
+    DL_MCAN_ProtocolStatus protocol_status;
+
+    if (status == 0) {
+        return;
+    }
+
+    DL_MCAN_getErrCounters(MCAN0_INST, &error_counters);
+    DL_MCAN_getProtocolStatus(MCAN0_INST, &protocol_status);
+    status->tx_error_count = (uint8_t)error_counters.transErrLogCnt;
+    status->rx_error_count = (uint8_t)error_counters.recErrCnt;
+    status->error_passive = (uint8_t)protocol_status.errPassive;
+    status->warning = (uint8_t)protocol_status.warningStatus;
+    status->bus_off = (uint8_t)protocol_status.busOffStatus;
+    status->last_error_code = (uint8_t)protocol_status.lastErrCode;
+}
+
+uint8_t ZdtMotor_Stop(void)
 {
     const uint8_t command[4] = {
         0xFEU, 0x98U, 0x00U, ZDT_MOTOR_CHECKSUM
@@ -150,8 +172,11 @@ void ZdtMotor_Stop(void)
     if (g_moving != 0U) {
         if (send_command(command, sizeof(command)) != 0U) {
             g_moving = 0U;
+            return 1U;
         }
+        return 0U;
     }
+    return 1U;
 }
 
 void ZdtMotor_Poll(void)

@@ -31,6 +31,8 @@
 #define KEY2_TURN_ENABLE_MS            500U /* 起步后此时间内不判定进入半圆。 */
 #define KEY2_TURN_CONFIRM_MS           50U /* 角速度连续超限确认时间。 */
 #define KEY2_TURN_RATE_DPS             20.0f /* 半圆入口角速度阈值，单位 °/s。 */
+#define KEY2_START_RAMP_MS            1200U /* KEY2 起步由慢到正常速度的渐变时间。 */
+#define KEY2_START_PWM                1650  /* KEY2 渐变起点；PWM 反向，值越大起步越慢。 */
 #define JY901S_GYRO_RANGE_DPS       2000.0f /* JY901S 陀螺仪量程为 ±2000 °/s。 */
 
 static volatile uint32_t sSystemTickMs;
@@ -58,6 +60,20 @@ static float yaw_delta_degrees(float current_yaw, float previous_yaw)
 static float absolute_float(float value)
 {
     return (value < 0.0f) ? -value : value;
+}
+
+static int16_t key2_ramp_base_speed(uint32_t elapsed_ms)
+{
+    int32_t speed_difference;
+
+    if (elapsed_ms >= KEY2_START_RAMP_MS) {
+        return LINE_BASE_SPEED;
+    }
+
+    speed_difference = (int32_t)KEY2_START_PWM - LINE_BASE_SPEED;
+    return (int16_t)(KEY2_START_PWM -
+                     (speed_difference * (int32_t)elapsed_ms) /
+                     (int32_t)KEY2_START_RAMP_MS);
 }
 
 static void format_elapsed_time(char line[17], uint32_t elapsed_ms)
@@ -290,6 +306,10 @@ int main(void)
             (now - last_line_update_ms) >= LINE_CONTROL_PERIOD_MS) {
             last_line_update_ms = now;
             gray_map = Gray_ReadAll();
+
+            if (key2_tracking) {
+                Line_SetBaseSpeed(key2_ramp_base_speed(now - run_start_ms));
+            }
 
             if (line_tracking && key1_stop_line_enabled &&
                 Gray_BlackCount(gray_map) >= KEY1_STOP_LINE_BLACK_COUNT) {
