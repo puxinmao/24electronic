@@ -3,6 +3,7 @@
 #include "usart.h"
 #include "yb_protocol.h"
 
+
 /*
  * 水管升降平衡控制。
  *
@@ -19,28 +20,13 @@
 #define K230_RIGHT_EDGE_OFFSET_PIXELS    (319)
 #define BALL_POSITION_SCALE              (100)   /* 100 = 1.00 位置单位 */
 #define BALL_POSITION_LIMIT             (1250)  /* 12.50 * 100 */
-#define BALL_POSITION_DEADBAND             (8)  /* 平衡点 +/-0.08 cm 内不动作（约 2 像素） */
-#undef BALL_POSITION_DEADBAND
-#define BALL_POSITION_DEADBAND            (15)  /* Stop inside +/-0.15 cm of the center. */
-#define BALL_RESTART_DEADBAND             (25)  /* Leave center hold only beyond +/-0.25 cm. */
-#define BALL_BRAKE_ZONE                   (90)  /* Base predictive braking zone: 0.90 cm */
-#define BALL_PREDICTIVE_BRAKE_GAIN          (4)  /* Extra braking zone per frame displacement */
-#define BALL_BRAKE_ZONE_MAX              (220)  /* Fast-approach braking limit: 2.20 cm */
+#define BALL_POSITION_DEADBAND            (10)  /* Stop inside +/-0.10 cm of the center. */
+#define BALL_RESTART_DEADBAND             (16)  /* Restart beyond +/-0.16 cm. */
 #define BALL_TARGET_SLOW_ZONE            (200)  /* Slow down within 2.00 cm of balance */
-#define BALL_MOTION_THRESHOLD              (4)  /* 0.04 cm/帧以下视为视觉微小抖动 */
 #define BALL_MIN_CONFIDENCE               (35)  /* K230 score: 0..100 */
 
 /* 自动轨迹：O(0 cm) -> +5 cm -> -5 cm，最终稳定在 -5 cm 附近。 */
-#define TRAJECTORY_TEST_ENABLE              (0)
 #define TRAJECTORY_ORIGIN_POSITION          (0)
-#define TRAJECTORY_PLUS_TARGET            (500) /* +5.00 cm */
-#define TRAJECTORY_MINUS_TARGET          (-500) /* -5.00 cm */
-#define TRAJECTORY_START_TOLERANCE          (50) /* O 点启动判定：+/-0.50 cm */
-#define TRAJECTORY_TARGET_TOLERANCE        (100) /* +5/-5 点最大允许误差：+/-1.00 cm */
-#define TRAJECTORY_START_CONFIRM_FRAMES      (3)
-#define TRAJECTORY_TURN_CONFIRM_FRAMES       (3)
-#define TRAJECTORY_FINAL_STABLE_FRAMES      (10)
-#define TRAJECTORY_MAX_TIME_MS            (5000)
 /*
  * 参考轨迹采用“限速 + 跟随窗口”而非直接跳变：
  * - 每个新视觉帧设定值最多前进 0.12 cm；
@@ -49,26 +35,21 @@
  * 即使相机连续给出相同位置，设定值也会停下来等小球跟上，因而不会在
  * O -> +5 cm 起步阶段积累一个很大的 PID 误差并把小球直接冲到端部。
  */
-#define TRAJECTORY_REFERENCE_STEP_PER_FRAME  (12)
-#define TRAJECTORY_REFERENCE_FOLLOW_WINDOW   (45)
 
 /*
  * 离散 PID（每个有效 K230 帧执行一次；适用于稳定、较高的视觉帧率）。
  * P、I、D 均为定点分数，避免在 Cortex-M0+ 上使用软件浮点。
  * 初始值偏保守：先保证不明显过冲，再按下方说明逐步调大 Kp / Kd。
  */
-#define PID_FILTER_DIVISOR                (2)   /* Faster feedback: new sample weight 1/2 */
-#define PID_KP_NUM                         (60) /* Kp = 0.60: stronger correction */
-#define PID_KI_NUM                          (0) /* Ki = 0.01 / frame */
-#define PID_KD_NUM                         (55) /* Kd = 0.55 */
+#define PID_FILTER_DIVISOR                (1)   /* Use the current vision frame immediately. */
+#define PID_KP_NUM                         (10) /* Kp = 0.95 */
+#define PID_KI_NUM                          (0) /* Enable only after PD is stable. */
+#define PID_KD_NUM                        (400) /* Kd = 2.40 */
+#define PID_DERIVATIVE_DEADBAND             (8) /* Ignore <= 0.08 cm/frame vision jitter. */
 #define PID_GAIN_DEN                      (100)
-#define PID_INTEGRAL_LIMIT              (6000)
+#define PID_INTEGRAL_LIMIT              (3000) /* Limits I contribution to 0.90 command. */
 #define PID_OUTPUT_LIMIT                (1250)
-#define VELOCITY_BRAKE_DELTA              (20)  /* 0.80 cm per frame toward the center. */
-#define VELOCITY_BRAKE_CONFIRM_FRAMES       (1)
-#define PID_VELOCITY_BRAKE_OUTPUT         (700)
-#define VELOCITY_BRAKE_SETTLE_MS            (5)
-#define PID_OUTPUT_MIN                    (50)  /* 最小有效纠正量，0.50 */
+#define PID_OUTPUT_MIN                    (30)  /* Start correcting from 0.30 command. */
 
 /* Emm_V5 / ZDT_X CAN1_MAP 参数；须与电机内部设置相同。 */
 #define MOTOR_ID                           (1)
@@ -80,30 +61,20 @@
  * 本机构当前接线/机械方向：抬高水管=CCW，降低水管=CW。
  * 首次上机时务必低速验证；若方向相反，只交换下面两个宏，不要改 PID 符号。
  */
-#define MOTOR_DIRECTION_RAISE     MOTOR_DIR_CW
-#define MOTOR_DIRECTION_LOWER     MOTOR_DIR_CCW
+#define MOTOR_DIRECTION_RAISE     MOTOR_DIR_CCW
+#define MOTOR_DIRECTION_LOWER     MOTOR_DIR_CW
 
 /* F6 为持续速度命令。采用短脉冲以减小每次水管位移。 */
 #define MOTOR_ACCEL_LEVEL                  (3)
-#define MOTOR_MIN_SPEED_RPM                (5)
-#define MOTOR_CRUISE_SPEED_RPM             (6)  /* Faster correction away from balance */
-#define MOTOR_MAX_SPEED_RPM                (7)
+#define MOTOR_MIN_SPEED_RPM                (6)
+#define MOTOR_CRUISE_SPEED_RPM             (8)
+#define MOTOR_MAX_SPEED_RPM               (10)
 #define MOTOR_PULSE_MIN_MS                (25)
-#define MOTOR_CRUISE_PULSE_MS             (40)
-#define MOTOR_PULSE_MAX_MS                (55)
-#define MOTOR_PULSE_GAP_MS                (10)
-#define MOTOR_RETURN_SETTLE_MS             (5)
-#define MOTOR_AUTO_RETURN_TO_BALANCE       (0)
-#define ACTUATOR_RAISE_LIMIT_RPM_MS       (MOTOR_CRUISE_SPEED_RPM * 200)
-#define ACTUATOR_LOWER_LIMIT_RPM_MS       (MOTOR_CRUISE_SPEED_RPM * 200)
-#define MOTOR_DIRECTION_SETTLE_MS         (40)  /* Let the mechanism settle before a reversal. */
+#define MOTOR_PULSE_MAX_MS                (45)
+#define MOTOR_PULSE_GAP_MS                 (3)
+#define MOTOR_DIRECTION_SETTLE_MS          (5)  /* Stop briefly before a reversal. */
 #define MOTOR_CAN_TX_TIMEOUT_MS           (10)
 #define VISION_LOST_TIMEOUT_MS           (300)
-#define VISION_FRAME_LOSS_CONFIRM_MS       (80)  /* No UART frame for this long is treated as a dropped vision stream. */
-#define VISION_LOST_LEFT_DELTA              (4)  /* 0.04 cm leftward movement between two valid frames. */
-#define VISION_LOST_CONTINUE_SPEED_RPM       (6)
-#define VISION_LOST_CONTINUE_PULSE_MS      (100)
-#define MOTION_FEEDBACK_DELTA               (8)  /* 0.08 cm change from the preceding frame. */
 
 #define MOTOR_CAN_EXT_ID          ((uint32_t)MOTOR_ID << 8U)
 #define MOTOR_CAN_TX_BUFFER                 (0U)
@@ -118,30 +89,11 @@ typedef enum {
 typedef struct {
     int filtered_position;
     int previous_error;
-    int previous_raw_error;
     int integral;
     uint8_t valid;
-    uint8_t crossed_target;
     uint8_t center_hold;
-    uint8_t toward_center_frames;
-    uint8_t velocity_braking;
 } BallPidController;
 
-typedef enum {
-    TRAJECTORY_WAIT_AT_ORIGIN = 0,
-    TRAJECTORY_MOVE_TO_PLUS,
-    TRAJECTORY_MOVE_TO_MINUS,
-    TRAJECTORY_HOLD_AT_MINUS,
-    TRAJECTORY_DONE,
-    TRAJECTORY_TIMEOUT
-} TrajectoryState;
-
-typedef struct {
-    TrajectoryState state;
-    uint16_t elapsed_ms;
-    uint8_t consecutive_in_target_frames;
-    int reference_position; /* 斜坡后的 PID 设定值，不直接跳到 +/-5 cm */
-} TrajectoryController;
 
 static MotorState g_motor_state = MOTOR_STATE_UNKNOWN;
 static uint8_t g_last_direction = MOTOR_DIRECTION_RAISE;
@@ -150,18 +102,11 @@ static uint8_t g_motor_enabled = 0U;
 static uint16_t g_motor_pulse_ms_left = 0U;
 static uint16_t g_motor_pulse_gap_ms_left = 0U;
 static uint16_t g_active_speed_rpm = 0U;
-static int32_t g_actuator_offset_rpm_ms = 0;
-static uint8_t g_return_to_balance_pending = 0U;
-static uint8_t g_returning_to_balance = 0U;
-static uint8_t g_return_after_pulse = 0U;
-static int g_previous_motion_position = 0;
-static uint8_t g_motion_position_valid = 0U;
-static uint8_t g_motion_feedback_active = 0U;
+static uint8_t g_pending_command_valid = 0U;
+static uint8_t g_pending_direction = MOTOR_DIRECTION_RAISE;
+static uint16_t g_pending_speed_rpm = 0U;
+static uint16_t g_pending_pulse_ms = 0U;
 static BallPidController g_pid = {0};
-static TrajectoryController g_trajectory = { TRAJECTORY_WAIT_AT_ORIGIN, 0U, 0U, TRAJECTORY_ORIGIN_POSITION };
-static int g_previous_ball_position = 0;
-static int g_latest_ball_position = 0;
-static uint8_t g_ball_position_history_count = 0U;
 
 static int clamp_int(int value, int min_value, int max_value)
 {
@@ -194,68 +139,13 @@ static int ball_x_pixels_to_position(int cx_pixels)
            K230_RIGHT_EDGE_OFFSET_PIXELS;
 }
 
-static void record_ball_position(int position)
-{
-    if (g_ball_position_history_count > 0U) {
-        g_previous_ball_position = g_latest_ball_position;
-    }
-    g_latest_ball_position = position;
-    if (g_ball_position_history_count < 2U) {
-        g_ball_position_history_count++;
-    }
-}
-
-static uint8_t ball_was_rolling_left(void)
-{
-    return ((g_ball_position_history_count >= 2U) &&
-            ((g_latest_ball_position - g_previous_ball_position) <=
-             -VISION_LOST_LEFT_DELTA)) ? 1U : 0U;
-}
-
-static uint8_t ball_was_rolling_right(void)
-{
-    return ((g_ball_position_history_count >= 2U) &&
-            ((g_latest_ball_position - g_previous_ball_position) >=
-             VISION_LOST_LEFT_DELTA)) ? 1U : 0U;
-}
-
 static void ball_pid_reset(void)
 {
     g_pid.filtered_position = 0;
     g_pid.previous_error = 0;
-    g_pid.previous_raw_error = 0;
     g_pid.integral = 0;
     g_pid.valid = 0U;
-    g_pid.crossed_target = 0U;
     g_pid.center_hold = 0U;
-    g_pid.toward_center_frames = 0U;
-    g_pid.velocity_braking = 0U;
-    g_motion_position_valid = 0U;
-    g_motion_feedback_active = 0U;
-}
-
-static int apply_motion_feedback(int position, int fallback_command)
-{
-    int position_delta;
-
-    g_motion_feedback_active = 0U;
-    if (g_motion_position_valid == 0U) {
-        g_previous_motion_position = position;
-        g_motion_position_valid = 1U;
-        return fallback_command;
-    }
-
-    position_delta = position - g_previous_motion_position;
-    g_previous_motion_position = position;
-    if (position_delta >= MOTION_FEEDBACK_DELTA) {
-        g_motion_feedback_active = 1U;
-        return -PID_VELOCITY_BRAKE_OUTPUT;
-    }
-    if (position_delta <= -MOTION_FEEDBACK_DELTA) {
-        g_motion_feedback_active = 1U;
-        return PID_VELOCITY_BRAKE_OUTPUT;
-    }
-    return fallback_command;
 }
 
 /*
@@ -265,57 +155,31 @@ static int apply_motion_feedback(int position, int fallback_command)
  */
 static int ball_pid_update(int raw_position, int target_position)
 {
-    int raw_error;
     int error;
     int derivative;
     int next_integral;
     int command;
-    int position_delta = 0;
-    int brake_zone;
     int32_t numerator;
 
     raw_position = clamp_int(raw_position, -BALL_POSITION_LIMIT,
                              BALL_POSITION_LIMIT);
-    raw_error = target_position - raw_position;
-    g_pid.crossed_target = 0U;
-    g_pid.velocity_braking = 0U;
 
     if (g_pid.valid == 0U) {
         g_pid.filtered_position = raw_position;
-        g_pid.previous_error = raw_error;
-        g_pid.previous_raw_error = raw_error;
+        g_pid.previous_error = target_position - raw_position;
         g_pid.integral = 0;
         g_pid.valid = 1U;
     } else {
-        int previous_filtered_position = g_pid.filtered_position;
-
-        /*
-         * Do not let the position low-pass filter hide a confirmed crossing
-         * of the balance point.  On a crossing, use the raw position now,
-         * reset integral, and let motor_track_ball stop/reverse immediately.
-         */
-        if (((raw_error > BALL_POSITION_DEADBAND) &&
-             (g_pid.previous_raw_error < -BALL_POSITION_DEADBAND)) ||
-            ((raw_error < -BALL_POSITION_DEADBAND) &&
-             (g_pid.previous_raw_error > BALL_POSITION_DEADBAND))) {
-            g_pid.crossed_target = 1U;
-            g_pid.filtered_position = raw_position;
-            g_pid.integral = 0;
-        } else {
-            g_pid.filtered_position +=
-                (raw_position - g_pid.filtered_position) / PID_FILTER_DIVISOR;
-        }
-        position_delta = g_pid.filtered_position - previous_filtered_position;
+        g_pid.filtered_position +=
+            (raw_position - g_pid.filtered_position) / PID_FILTER_DIVISOR;
     }
 
     error = target_position - g_pid.filtered_position;
-    derivative = error - g_pid.previous_error;
 
     if (g_pid.center_hold != 0U) {
         if (abs_int(error) <= BALL_RESTART_DEADBAND) {
             g_pid.integral = 0;
             g_pid.previous_error = error;
-            g_pid.previous_raw_error = raw_error;
             return 0;
         }
         g_pid.center_hold = 0U;
@@ -324,44 +188,14 @@ static int ball_pid_update(int raw_position, int target_position)
     if (abs_int(error) <= BALL_POSITION_DEADBAND) {
         g_pid.center_hold = 1U;
         g_pid.integral = 0;
-        g_pid.toward_center_frames = 0U;
         g_pid.previous_error = error;
-        g_pid.previous_raw_error = raw_error;
         return 0;
     }
 
-    if (((error > 0) && (position_delta >= VELOCITY_BRAKE_DELTA)) ||
-        ((error < 0) && (position_delta <= -VELOCITY_BRAKE_DELTA))) {
-        if (g_pid.toward_center_frames < VELOCITY_BRAKE_CONFIRM_FRAMES) {
-            g_pid.toward_center_frames++;
-        }
-    } else {
-        g_pid.toward_center_frames = 0U;
+    derivative = error - g_pid.previous_error;
+    if (abs_int(derivative) <= PID_DERIVATIVE_DEADBAND) {
+        derivative = 0;
     }
-
-    if (g_pid.toward_center_frames >= VELOCITY_BRAKE_CONFIRM_FRAMES) {
-        g_pid.integral = 0;
-        g_pid.velocity_braking = 1U;
-        g_pid.previous_error = error;
-        g_pid.previous_raw_error = raw_error;
-        return (error > 0) ? -PID_VELOCITY_BRAKE_OUTPUT :
-                             PID_VELOCITY_BRAKE_OUTPUT;
-    }
-
-    /* Expand the no-drive zone when the ball is approaching O quickly. */
-    brake_zone = clamp_int(BALL_BRAKE_ZONE +
-                           (abs_int(position_delta) * BALL_PREDICTIVE_BRAKE_GAIN),
-                           BALL_BRAKE_ZONE, BALL_BRAKE_ZONE_MAX);
-    if ((abs_int(error) <= brake_zone) &&
-        (abs_int(position_delta) >= BALL_MOTION_THRESHOLD) &&
-        (((error > 0) && (position_delta > 0)) ||
-         ((error < 0) && (position_delta < 0)))) {
-        g_pid.integral = (g_pid.integral * 3) / 4;
-        g_pid.previous_error = error;
-        g_pid.previous_raw_error = raw_error;
-        return 0;
-    }
-
     next_integral = clamp_int(g_pid.integral + error,
                               -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT);
     numerator = ((int32_t)PID_KP_NUM * error) +
@@ -369,18 +203,14 @@ static int ball_pid_update(int raw_position, int target_position)
                 ((int32_t)PID_KD_NUM * derivative);
     command = (int)(numerator / PID_GAIN_DEN);
     command = clamp_int(command, -PID_OUTPUT_LIMIT, PID_OUTPUT_LIMIT);
-
     if (!((command >= PID_OUTPUT_LIMIT) && (error > 0)) &&
         !((command <= -PID_OUTPUT_LIMIT) && (error < 0))) {
         g_pid.integral = next_integral;
     }
     g_pid.previous_error = error;
-    g_pid.previous_raw_error = raw_error;
 
-    if (((error > 0) && (command <= 0)) ||
-        ((error < 0) && (command >= 0)) ||
-        (abs_int(command) < PID_OUTPUT_MIN)) {
-        command = (error > 0) ? PID_OUTPUT_MIN : -PID_OUTPUT_MIN;
+    if (abs_int(command) < PID_OUTPUT_MIN) {
+        command = 0;
     }
     return command;
 }
@@ -390,60 +220,34 @@ static int ball_pid_update(int raw_position, int target_position)
  * 这样 O -> +5 cm 和 +5 -> -5 cm 的中段始终采用巡航能力，只有接近每个目标时
  * 才逐步减速，避免之前在 O 点附近被过早限速。
  */
-static int calculate_slow_zone_scale(int abs_error)
-{
-    if (abs_error >= BALL_TARGET_SLOW_ZONE) {
-        return 100;
-    }
-    if (abs_error <= BALL_POSITION_DEADBAND) {
-        return 0;
-    }
-    return ((abs_error - BALL_POSITION_DEADBAND) * 100) /
-           (BALL_TARGET_SLOW_ZONE - BALL_POSITION_DEADBAND);
-}
-
 static uint16_t calculate_speed_rpm(int effort, int abs_error)
 {
     int speed_range = MOTOR_MAX_SPEED_RPM - MOTOR_MIN_SPEED_RPM;
     int full_speed;
-    int slow_zone_scale;
-    int speed;
+
+    (void)abs_error;
 
     effort = clamp_int(effort, PID_OUTPUT_MIN, PID_OUTPUT_LIMIT);
     full_speed = MOTOR_MIN_SPEED_RPM +
         ((effort - PID_OUTPUT_MIN) * speed_range) /
         (PID_OUTPUT_LIMIT - PID_OUTPUT_MIN);
-    if (abs_error >= BALL_TARGET_SLOW_ZONE) {
-        full_speed = clamp_int(full_speed, MOTOR_CRUISE_SPEED_RPM,
+    return (uint16_t)clamp_int(full_speed, MOTOR_MIN_SPEED_RPM,
                                MOTOR_MAX_SPEED_RPM);
-    }
-
-    slow_zone_scale = calculate_slow_zone_scale(abs_error);
-    speed = MOTOR_MIN_SPEED_RPM +
-        ((full_speed - MOTOR_MIN_SPEED_RPM) * slow_zone_scale) / 100;
-    return (uint16_t)clamp_int(speed, MOTOR_MIN_SPEED_RPM, MOTOR_MAX_SPEED_RPM);
 }
 
 static uint16_t calculate_pulse_ms(int effort, int abs_error)
 {
     int pulse_range = MOTOR_PULSE_MAX_MS - MOTOR_PULSE_MIN_MS;
     int full_pulse;
-    int slow_zone_scale;
-    int pulse;
+
+    (void)abs_error;
 
     effort = clamp_int(effort, PID_OUTPUT_MIN, PID_OUTPUT_LIMIT);
     full_pulse = MOTOR_PULSE_MIN_MS +
         ((effort - PID_OUTPUT_MIN) * pulse_range) /
         (PID_OUTPUT_LIMIT - PID_OUTPUT_MIN);
-    if (abs_error >= BALL_TARGET_SLOW_ZONE) {
-        full_pulse = clamp_int(full_pulse, MOTOR_CRUISE_PULSE_MS,
+    return (uint16_t)clamp_int(full_pulse, MOTOR_PULSE_MIN_MS,
                                MOTOR_PULSE_MAX_MS);
-    }
-
-    slow_zone_scale = calculate_slow_zone_scale(abs_error);
-    pulse = MOTOR_PULSE_MIN_MS +
-        ((full_pulse - MOTOR_PULSE_MIN_MS) * slow_zone_scale) / 100;
-    return (uint16_t)clamp_int(pulse, MOTOR_PULSE_MIN_MS, MOTOR_PULSE_MAX_MS);
 }
 
 /* 近似延时，仅用于 CAN 请求等待与主循环约 1 ms 节拍。 */
@@ -568,136 +372,47 @@ static void motor_stop(void)
     g_motor_state = MOTOR_STATE_STOPPED;
     g_motor_pulse_ms_left = 0U;
     g_active_speed_rpm = 0U;
+    g_pending_command_valid = 0U;
 }
 
-static uint8_t actuator_can_move(uint8_t direction)
+static void motor_cancel_pending_command(void)
 {
-    if (direction == MOTOR_DIRECTION_RAISE) {
-        return (g_actuator_offset_rpm_ms < ACTUATOR_RAISE_LIMIT_RPM_MS) ? 1U : 0U;
-    }
-    return (g_actuator_offset_rpm_ms > -ACTUATOR_LOWER_LIMIT_RPM_MS) ? 1U : 0U;
+    g_pending_command_valid = 0U;
 }
 
-static void motor_request_return_to_balance(void)
+static void motor_start_pending_command(void)
 {
-    g_return_after_pulse = 0U;
-#if MOTOR_AUTO_RETURN_TO_BALANCE
-    if (g_actuator_offset_rpm_ms != 0) {
-        g_return_to_balance_pending = 1U;
-        g_motor_pulse_gap_ms_left = MOTOR_RETURN_SETTLE_MS;
-    }
-#endif
-}
-
-static void motor_start_return_to_balance(void)
-{
-    uint8_t direction;
-    uint32_t distance;
-    uint16_t pulse_ms;
-
-    if (g_actuator_offset_rpm_ms == 0) {
-        g_return_to_balance_pending = 0U;
+    if ((g_pending_command_valid == 0U) ||
+        (g_motor_state == MOTOR_STATE_RUNNING) ||
+        (g_motor_pulse_gap_ms_left > 0U)) {
         return;
     }
 
-    direction = (g_actuator_offset_rpm_ms > 0) ?
-        MOTOR_DIRECTION_LOWER : MOTOR_DIRECTION_RAISE;
-    distance = (g_actuator_offset_rpm_ms > 0) ?
-        (uint32_t)g_actuator_offset_rpm_ms :
-        (uint32_t)(-g_actuator_offset_rpm_ms);
-    pulse_ms = (uint16_t)((distance + MOTOR_CRUISE_SPEED_RPM - 1U) /
-                          MOTOR_CRUISE_SPEED_RPM);
-
-    if (motor_set_speed(direction, MOTOR_CRUISE_SPEED_RPM) != 0U) {
+    if (motor_set_speed(g_pending_direction, g_pending_speed_rpm) != 0U) {
         g_motor_state = MOTOR_STATE_RUNNING;
-        g_last_direction = direction;
-        g_active_speed_rpm = MOTOR_CRUISE_SPEED_RPM;
-        g_motor_pulse_ms_left = pulse_ms;
-        g_return_to_balance_pending = 0U;
-        g_returning_to_balance = 1U;
+        g_last_direction = g_pending_direction;
+        g_active_speed_rpm = g_pending_speed_rpm;
+        g_motor_pulse_ms_left = g_pending_pulse_ms;
     } else {
         g_motor_enabled = 0U;
         g_motor_state = MOTOR_STATE_STOPPED;
     }
+    g_pending_command_valid = 0U;
 }
 
 static void motor_control_tick_1ms(void)
 {
-    if (g_motor_state == MOTOR_STATE_RUNNING) {
-        if (g_last_direction == MOTOR_DIRECTION_RAISE) {
-            if (g_actuator_offset_rpm_ms >= ACTUATOR_RAISE_LIMIT_RPM_MS) {
-                motor_stop();
-                motor_request_return_to_balance();
-                return;
-            }
-            g_actuator_offset_rpm_ms += g_active_speed_rpm;
-        } else {
-            if (g_actuator_offset_rpm_ms <= -ACTUATOR_LOWER_LIMIT_RPM_MS) {
-                motor_stop();
-                motor_request_return_to_balance();
-                return;
-            }
-            g_actuator_offset_rpm_ms -= g_active_speed_rpm;
-        }
-    }
-
     if (g_motor_pulse_ms_left > 0U) {
         g_motor_pulse_ms_left--;
         if (g_motor_pulse_ms_left == 0U) {
             motor_stop();
-            if (g_returning_to_balance != 0U) {
-                g_actuator_offset_rpm_ms = 0;
-                g_returning_to_balance = 0U;
-                g_motor_pulse_gap_ms_left = MOTOR_PULSE_GAP_MS;
-            } else if (g_return_after_pulse != 0U) {
-                motor_request_return_to_balance();
-            } else {
-                g_motor_pulse_gap_ms_left = MOTOR_PULSE_GAP_MS;
-            }
+            g_motor_pulse_gap_ms_left = MOTOR_PULSE_GAP_MS;
         }
     } else if (g_motor_pulse_gap_ms_left > 0U) {
         g_motor_pulse_gap_ms_left--;
-    } else if (g_return_to_balance_pending != 0U) {
-        motor_start_return_to_balance();
-    }
-}
-
-/* Continue the last confirmed roll direction while vision is temporarily lost. */
-static void motor_continue_in_direction_on_vision_loss(uint8_t direction)
-{
-    if ((g_return_to_balance_pending != 0U) ||
-        (g_returning_to_balance != 0U)) {
-        return;
     }
 
-    g_return_after_pulse = 0U;
-    if (actuator_can_move(direction) == 0U) {
-        motor_stop();
-        return;
-    }
-
-    if (g_motor_state == MOTOR_STATE_RUNNING) {
-        if (g_last_direction == direction) {
-            g_motor_pulse_ms_left = VISION_LOST_CONTINUE_PULSE_MS;
-            return;
-        }
-
-        motor_stop();
-        g_motor_pulse_gap_ms_left = 0U;
-        return;
-    }
-
-    g_motor_pulse_gap_ms_left = 0U;
-    if (motor_set_speed(direction,
-                        VISION_LOST_CONTINUE_SPEED_RPM) != 0U) {
-        g_motor_state = MOTOR_STATE_RUNNING;
-        g_last_direction = direction;
-        g_active_speed_rpm = VISION_LOST_CONTINUE_SPEED_RPM;
-        g_motor_pulse_ms_left = VISION_LOST_CONTINUE_PULSE_MS;
-    } else {
-        g_motor_enabled = 0U;
-        g_motor_state = MOTOR_STATE_STOPPED;
-    }
+    motor_start_pending_command();
 }
 
 static void motor_can_init(void)
@@ -736,13 +451,6 @@ static int trajectory_goal_position(void)
 #else
     return TRAJECTORY_ORIGIN_POSITION;
 #endif
-}
-
-static uint8_t trajectory_is_active(void)
-{
-    return ((g_trajectory.state == TRAJECTORY_MOVE_TO_PLUS) ||
-            (g_trajectory.state == TRAJECTORY_MOVE_TO_MINUS) ||
-            (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS)) ? 1U : 0U;
 }
 
 /*
@@ -895,40 +603,22 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
     uint16_t pulse_ms;
     uint16_t speed_rpm;
 
-    if ((g_return_to_balance_pending != 0U) ||
-        (g_returning_to_balance != 0U)) {
-        return;
-    }
-
     if ((ball == 0) || (ball->score < BALL_MIN_CONFIDENCE)) {
         ball_pid_reset();
-        motor_request_return_to_balance();
+        motor_cancel_pending_command();
         motor_stop();
         return;
     }
 
     position = ball_x_pixels_to_position(ball->cx);
     command = ball_pid_update(position, target_position);
-    command = apply_motion_feedback(position, command);
-    if ((g_pid.crossed_target != 0U) &&
-        (g_motion_feedback_active == 0U)) {
-        motor_stop();
-        motor_request_return_to_balance();
-        return;
-    }
     if (command == 0) {
+        motor_cancel_pending_command();
         motor_stop();
-        motor_request_return_to_balance();
         return;
     }
 
     direction = motor_direction_from_pid_command(command);
-    if (actuator_can_move(direction) == 0U) {
-        ball_pid_reset();
-        motor_stop();
-        motor_request_return_to_balance();
-        return;
-    }
     abs_error = abs_int(position - target_position);
     pulse_ms = calculate_pulse_ms(abs_int(command), abs_error);
 
@@ -936,7 +626,11 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
         if (direction != g_last_direction) {
             /* 方向反转时先刹停；防止水管惯性和 PID 积分共同放大振荡。 */
             motor_stop();
-            motor_request_return_to_balance();
+            g_pending_command_valid = 1U;
+            g_pending_direction = direction;
+            g_pending_speed_rpm = calculate_speed_rpm(abs_int(command), abs_error);
+            g_pending_pulse_ms = pulse_ms;
+            g_motor_pulse_gap_ms_left = MOTOR_DIRECTION_SETTLE_MS;
         } else if (g_motor_pulse_ms_left > pulse_ms) {
             /* 新帧要求更小修正时，仅缩短当前脉冲，绝不延长它。 */
             g_motor_pulse_ms_left = pulse_ms;
@@ -945,6 +639,10 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
     }
 
     if (g_motor_pulse_gap_ms_left > 0U) {
+        g_pending_command_valid = 1U;
+        g_pending_direction = direction;
+        g_pending_speed_rpm = calculate_speed_rpm(abs_int(command), abs_error);
+        g_pending_pulse_ms = pulse_ms;
         return;
     }
 
@@ -954,7 +652,6 @@ static void motor_track_ball(const BallInfo *ball, int target_position)
         g_last_direction = direction;
         g_active_speed_rpm = speed_rpm;
         g_motor_pulse_ms_left = pulse_ms;
-        g_return_after_pulse = 0U;
     } else {
         g_motor_enabled = 0U;
         g_motor_state = MOTOR_STATE_STOPPED;
@@ -983,6 +680,9 @@ static uint8_t take_latest_ball(BallInfo *ball)
 }
 
 int main(void)
+#if 0
+·{
+#endif
 {
     BallInfo ball;
     uint8_t ball_state;
@@ -997,46 +697,22 @@ int main(void)
     while (1) {
         ball_state = take_latest_ball(&ball);
         if (ball_state == 1U) {
-            int position = ball_x_pixels_to_position(ball.cx);
-
             vision_silence_ms = 0U;
-            if (ball.score >= BALL_MIN_CONFIDENCE) {
-                record_ball_position(position);
-            }
-            trajectory_update_on_measurement(position);
-            if (g_trajectory.state == TRAJECTORY_TIMEOUT) {
-                motor_stop();
-            } else {
-                trajectory_advance_reference(position);
-                motor_track_ball(&ball, trajectory_control_target_position());
-            }
+            motor_track_ball(&ball, TRAJECTORY_ORIGIN_POSITION);
         } else if (ball_state == 2U) {
             vision_silence_ms = 0U;
-            if (ball_was_rolling_left() != 0U) {
-                motor_continue_in_direction_on_vision_loss(MOTOR_DIRECTION_RAISE);
-            } else if (ball_was_rolling_right() != 0U) {
-                motor_continue_in_direction_on_vision_loss(MOTOR_DIRECTION_LOWER);
-            } else {
-                ball_pid_reset();
-                motor_stop();
-            }
+            ball_pid_reset();
+            motor_stop();
         } else {
             if (vision_silence_ms < VISION_LOST_TIMEOUT_MS) {
                 vision_silence_ms++;
             }
-            if ((vision_silence_ms >= VISION_FRAME_LOSS_CONFIRM_MS) &&
-                (ball_was_rolling_left() != 0U)) {
-                motor_continue_in_direction_on_vision_loss(MOTOR_DIRECTION_RAISE);
-            } else if ((vision_silence_ms >= VISION_FRAME_LOSS_CONFIRM_MS) &&
-                       (ball_was_rolling_right() != 0U)) {
-                motor_continue_in_direction_on_vision_loss(MOTOR_DIRECTION_LOWER);
-            } else if (vision_silence_ms >= VISION_LOST_TIMEOUT_MS) {
+            if (vision_silence_ms >= VISION_LOST_TIMEOUT_MS) {
                 ball_pid_reset();
                 motor_stop();
             }
         }
 
-        trajectory_tick_1ms();
         motor_control_tick_1ms();
         motor_delay_us(1000U);
     }
