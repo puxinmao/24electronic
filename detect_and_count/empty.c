@@ -33,6 +33,7 @@
 #define TRAJECTORY_PLUS_TURN_POSITION     (350)  /* Turn toward -5.00 cm at +3.50 cm. */
 #define TRAJECTORY_MINUS_BALANCE_POSITION (-350) /* Begin balancing at -3.50 cm. */
 #define TRAJECTORY_FINAL_CONFIRM_FRAMES      (5)
+#define TRAJECTORY_BUTTON_DEBOUNCE_MS        (30)
 /*
  * 按键后目标直接设为 +5 cm，到位后直接切换为 -5 cm。
  * 全程使用同一个 PD 闭环；到达 -5 cm 后持续保持该目标。
@@ -130,6 +131,9 @@ static uint8_t g_pending_direction = MOTOR_DIRECTION_RAISE;
 static uint16_t g_pending_speed_rpm = 0U;
 static uint16_t g_pending_pulse_ms = 0U;
 static BallPdController g_pd = {0};
+static uint8_t g_button_last_sample = 1U;
+static uint8_t g_button_stable_level = 1U;
+static uint16_t g_button_debounce_ms = 0U;
 static TrajectoryController g_trajectory = {
     TRAJECTORY_WAIT_AT_ORIGIN, 0U
 };
@@ -514,6 +518,28 @@ static uint8_t task_trajectory_is_active(void)
             (g_trajectory.state == TRAJECTORY_HOLD_AT_MINUS)) ? 1U : 0U;
 }
 
+static uint8_t trajectory_start_button_pressed(void)
+{
+    uint8_t sample = (DL_GPIO_readPins(KEY_PORT, KEY_PIN_0_PIN) != 0U) ?
+        1U : 0U;
+
+    if (sample != g_button_last_sample) {
+        g_button_last_sample = sample;
+        g_button_debounce_ms = 0U;
+        return 0U;
+    }
+    if (g_button_debounce_ms < TRAJECTORY_BUTTON_DEBOUNCE_MS) {
+        g_button_debounce_ms++;
+        return 0U;
+    }
+    if (sample == g_button_stable_level) {
+        return 0U;
+    }
+
+    g_button_stable_level = sample;
+    return (sample == 0U) ? 1U : 0U;
+}
+
 static void task_trajectory_start(void)
 {
     g_trajectory.state = TRAJECTORY_FORCE_RAISE_TO_PLUS;
@@ -662,10 +688,14 @@ int main(void)
     SYSCFG_DL_init();
     uart2_init();
     motor_can_init();
-    task_trajectory_start();
-    motor_power_on_raise();
 
     while (1) {
+        if ((task_trajectory_is_active() == 0U) &&
+            (trajectory_start_button_pressed() != 0U)) {
+            task_trajectory_start();
+            motor_power_on_raise();
+        }
+
         ball_state = take_latest_ball(&ball);
         if (ball_state == 1U) {
             frame_interval_ms = vision_silence_ms;
@@ -677,10 +707,12 @@ int main(void)
                 task_trajectory_update_on_measurement(
                     ball_x_pixels_to_position(ball.cx));
             }
-            motor_track_ball(&ball, task_trajectory_target_position(),
-                             frame_interval_ms,
-                             task_trajectory_uses_drive_pd());
-            task_trajectory_confirm_final_position();
+            if (task_trajectory_is_active() != 0U) {
+                motor_track_ball(&ball, task_trajectory_target_position(),
+                                 frame_interval_ms,
+                                 task_trajectory_uses_drive_pd());
+                task_trajectory_confirm_final_position();
+            }
         } else if (ball_state == 2U) {
             vision_silence_ms = 0U;
             ball_pd_reset();
