@@ -53,11 +53,11 @@ int main(void)
     ZdtMotor_Enable();
     if ((ZDT_STARTUP_TEST_ENABLED != 0U) &&
         (ZdtMotor_IsReady() != 0U)) {
-        ZdtMotor_SetSpeed(ZDT_PIPE_RAISE, ZDT_MOTOR_SPEED_RPM);
+        ZdtMotor_SetSpeed(ZDT_PIPE_RAISE, ZDT_MOTOR_MIN_SPEED_RPM);
         wait_milliseconds(ZDT_STARTUP_TEST_DURATION_MS);
         ZdtMotor_Stop();
         wait_milliseconds(ZDT_STARTUP_TEST_DURATION_MS);
-        ZdtMotor_SetSpeed(ZDT_PIPE_LOWER, ZDT_MOTOR_SPEED_RPM);
+        ZdtMotor_SetSpeed(ZDT_PIPE_LOWER, ZDT_MOTOR_MIN_SPEED_RPM);
         wait_milliseconds(ZDT_STARTUP_TEST_DURATION_MS);
         ZdtMotor_Stop();
     }
@@ -73,8 +73,6 @@ int main(void)
             if (control_command.action == BALL_CONTROL_MOVE) {
                 ZdtMotor_SetSpeed(control_command.direction,
                                   control_command.speed_rpm);
-                wait_milliseconds(control_command.duration_ms);
-                ZdtMotor_Stop();
             } else {
                 ZdtMotor_Stop();
             }

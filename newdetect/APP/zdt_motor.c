@@ -115,7 +115,9 @@ void ZdtMotor_SetSpeed(ZdtPipeDirection direction, uint16_t speed_rpm)
         ZdtMotor_Stop();
         return;
     }
-    ZdtMotor_Enable();
+    if (g_enabled == 0U) {
+        ZdtMotor_Enable();
+    }
     if (g_enabled == 0U) {
         return;
     }

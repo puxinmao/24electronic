@@ -15,7 +15,6 @@ typedef struct {
     BallControlAction action;
     ZdtPipeDirection direction;
     uint16_t speed_rpm;
-    uint16_t duration_ms;
     int16_t position_centi_cm;
 } BallControlCommand;
 

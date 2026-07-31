@@ -11,6 +11,7 @@ typedef struct {
     uint32_t previous_time_ms;
     uint8_t initialized;
     uint8_t holding_center;
+    uint8_t overshoot_brake_active;
 } CascadeController;
 
 static CascadeController g_controller;
@@ -61,6 +62,7 @@ void BallController_Reset(void)
     g_controller.previous_time_ms = 0U;
     g_controller.initialized = 0U;
     g_controller.holding_center = 0U;
+    g_controller.overshoot_brake_active = 0U;
 }
 
 void BallController_Init(void)
@@ -72,11 +74,13 @@ BallControlCommand BallController_Update(const BallSample *sample,
                                          uint32_t now_ms)
 {
     BallControlCommand command = {
-        BALL_CONTROL_STOP, ZDT_PIPE_RAISE, 0U, 0U, 0
+        BALL_CONTROL_STOP, ZDT_PIPE_RAISE, 0U, 0
     };
     uint32_t dt_ms = CONTROL_DT_DEFAULT_MS;
     float dt_seconds;
     float position_cm;
+    float predicted_position_cm;
+    float overshoot_compensation_cm;
     float raw_velocity;
     float position_error;
     float desired_velocity;
@@ -84,7 +88,7 @@ BallControlCommand BallController_Update(const BallSample *sample,
     float velocity_error_derivative;
     float pulse_rate;
     float effort;
-    uint16_t duration_ms;
+    uint16_t speed_rpm;
 
     if ((sample == 0) || (sample->score < BALL_MIN_SCORE)) {
         BallController_Reset();
@@ -126,6 +130,13 @@ BallControlCommand BallController_Update(const BallSample *sample,
         }
         g_controller.holding_center = 0U;
     }
+    if ((g_controller.overshoot_brake_active != 0U) &&
+        ((position_cm * g_controller.filtered_velocity) > 0.0f)) {
+        g_controller.overshoot_brake_active = 0U;
+        g_controller.position_integral = 0.0f;
+        g_controller.velocity_integral = 0.0f;
+        g_controller.previous_velocity_error = 0.0f;
+    }
     if ((absolute_float(position_cm) <= BALL_DEAD_ZONE_ENTER_CM) &&
         (absolute_float(g_controller.filtered_velocity) <=
          BALL_HOLD_VELOCITY_CM_S)) {
@@ -135,13 +146,31 @@ BallControlCommand BallController_Update(const BallSample *sample,
         return command;
     }
 
-    position_error = -position_cm;
-    g_controller.position_integral = clamp_float(
-        g_controller.position_integral + (position_error * dt_seconds),
-        -POSITION_PID_INTEGRAL_LIMIT, POSITION_PID_INTEGRAL_LIMIT);
-    desired_velocity = (POSITION_PID_KP * position_error) +
-        (POSITION_PID_KI * g_controller.position_integral) -
-        (POSITION_PID_KD * g_controller.filtered_velocity);
+    overshoot_compensation_cm = clamp_float(
+        g_controller.filtered_velocity * BALL_OVERSHOOT_COMPENSATION_S,
+        -BALL_OVERSHOOT_COMPENSATION_MAX_CM,
+        BALL_OVERSHOOT_COMPENSATION_MAX_CM);
+    predicted_position_cm = position_cm + overshoot_compensation_cm;
+    position_error = -predicted_position_cm;
+    if (((position_cm * g_controller.filtered_velocity) < 0.0f) &&
+        (absolute_float(g_controller.filtered_velocity) >=
+         BALL_OVERSHOOT_BRAKE_MIN_CM_S) &&
+        (absolute_float(predicted_position_cm) <=
+         BALL_OVERSHOOT_BRAKE_ZONE_CM) &&
+        (g_controller.overshoot_brake_active == 0U)) {
+        g_controller.overshoot_brake_active = 1U;
+        g_controller.position_integral = 0.0f;
+        g_controller.velocity_integral = 0.0f;
+        g_controller.previous_velocity_error = 0.0f;
+        return command;
+    } else {
+        g_controller.position_integral = clamp_float(
+            g_controller.position_integral + (position_error * dt_seconds),
+            -POSITION_PID_INTEGRAL_LIMIT, POSITION_PID_INTEGRAL_LIMIT);
+        desired_velocity = (POSITION_PID_KP * position_error) +
+            (POSITION_PID_KI * g_controller.position_integral) -
+            (POSITION_PID_KD * g_controller.filtered_velocity);
+    }
     desired_velocity = clamp_float(
         desired_velocity, -BALL_TARGET_VELOCITY_LIMIT_CM_S,
         BALL_TARGET_VELOCITY_LIMIT_CM_S);
@@ -161,20 +190,15 @@ BallControlCommand BallController_Update(const BallSample *sample,
                              MOTOR_PULSE_RATE_LIMIT_PPS);
 
     effort = absolute_float(pulse_rate) / MOTOR_PULSE_RATE_LIMIT_PPS;
-    duration_ms = (uint16_t)(ZDT_MOTOR_MIN_PULSE_MS +
-        (effort * (float)(ZDT_MOTOR_MAX_PULSE_MS -
-                           ZDT_MOTOR_MIN_PULSE_MS)));
-    if (duration_ms < ZDT_MOTOR_MIN_PULSE_MS) {
-        return command;
+    speed_rpm = (uint16_t)(ZDT_MOTOR_MIN_SPEED_RPM +
+        (effort * (float)(ZDT_MOTOR_MAX_SPEED_RPM -
+                           ZDT_MOTOR_MIN_SPEED_RPM)));
+    if (speed_rpm > ZDT_MOTOR_MAX_SPEED_RPM) {
+        speed_rpm = ZDT_MOTOR_MAX_SPEED_RPM;
     }
-    if (duration_ms > ZDT_MOTOR_MAX_PULSE_MS) {
-        duration_ms = ZDT_MOTOR_MAX_PULSE_MS;
-    }
-
     command.action = BALL_CONTROL_MOVE;
     command.direction = (pulse_rate > 0.0f) ?
         ZDT_PIPE_RAISE : ZDT_PIPE_LOWER;
-    command.speed_rpm = ZDT_MOTOR_SPEED_RPM;
-    command.duration_ms = duration_ms;
+    command.speed_rpm = speed_rpm;
     return command;
 }
