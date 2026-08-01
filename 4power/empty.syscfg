@@ -27,7 +27,6 @@ const SYSCTL = scripting.addModule("/ti/driverlib/SYSCTL");
 const UART   = scripting.addModule("/ti/driverlib/UART", {}, false);
 const UART1  = UART.addInstance();
 const UART2  = UART.addInstance();
-const UART3  = UART.addInstance();
 
 /**
  * Write custom configuration values to the imported modules.
@@ -68,7 +67,7 @@ GPIO2.associatedPins[1].pin.$assign      = "PB15";
 GPIO2.associatedPins[2].$name            = "KEY3";
 GPIO2.associatedPins[2].direction        = "INPUT";
 GPIO2.associatedPins[2].internalResistor = "PULL_UP";
-GPIO2.associatedPins[2].pin.$assign      = "PA7";
+GPIO2.associatedPins[2].pin.$assign      = "PA8";
 GPIO2.associatedPins[3].$name            = "KEY4";
 GPIO2.associatedPins[3].direction        = "INPUT";
 GPIO2.associatedPins[3].internalResistor = "PULL_UP";
@@ -196,27 +195,12 @@ UART1.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
 UART1.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
 UART1.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
 
-UART2.$name                            = "UART_0";
-UART2.targetBaudRate                   = 115200;
-UART2.peripheral.$assign               = "UART1";
-UART2.peripheral.rxPin.$assign         = "PA9";
-UART2.peripheral.txPin.$assign         = "PA8";
-UART2.txPinConfig.direction            = scripting.forceWrite("OUTPUT");
-UART2.txPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART2.txPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART2.txPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-UART2.txPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric11";
-UART2.rxPinConfig.hideOutputInversion  = scripting.forceWrite(false);
-UART2.rxPinConfig.onlyInternalResistor = scripting.forceWrite(false);
-UART2.rxPinConfig.passedPeripheralType = scripting.forceWrite("Digital");
-UART2.rxPinConfig.$name                = "ti_driverlib_gpio_GPIOPinGeneric3";
-
-UART3.$name                    = "UART_2";
-UART3.targetBaudRate           = 115200;
-UART3.direction                = "RX";
-UART3.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric10";
-UART3.peripheral.$assign       = "UART2";
-UART3.peripheral.rxPin.$assign = "PB16";
+UART2.$name                    = "UART_2";
+UART2.targetBaudRate           = 115200;
+UART2.direction                = "RX";
+UART2.rxPinConfig.$name        = "ti_driverlib_gpio_GPIOPinGeneric10";
+UART2.peripheral.$assign       = "UART2";
+UART2.peripheral.rxPin.$assign = "PB16";
 
 /**
  * Pinmux solution for unlocked pins/peripherals. This ensures that minor changes to the automatic solver in a future

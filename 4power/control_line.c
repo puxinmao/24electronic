@@ -2,6 +2,7 @@
  * control_line.c - 灰度循迹实现
  */
 #include "control_line.h"
+#include "motor.h"
 #include "pid.h"
 #include "speed_control.h"
 #include "ti_msp_dl_config.h"
@@ -28,14 +29,17 @@ static PID_t  sPid;
 static int16_t sBaseSpeed = 500;
 static float  sError = 0.0f;
 static float  sCorr  = 0.0f;
+static float  sCorrectionScale = 1.0f;
+static float  sCorrectionLimit = LINE_CORR_LIMIT;
+static float  sEdgeMinCorrection = LINE_EDGE_MIN_CORR;
 static float  sLastValidError = 0.0f;
 static uint32_t sLastUpdateMs = 0;
 static bool sFirstUpdate = false;
 
-static int16_t line_clamp_pwm(int16_t pwm)
+static int16_t line_clamp_pwm(int16_t pwm, int16_t pwm_max)
 {
     if (pwm < LINE_PWM_MIN) return LINE_PWM_MIN;
-    if (pwm > LINE_PWM_MAX) return LINE_PWM_MAX;
+    if (pwm > pwm_max) return pwm_max;
     return pwm;
 }
 
@@ -43,10 +47,28 @@ static int16_t line_clamp_pwm(int16_t pwm)
 
 void Line_Config(float kp, float ki, float kd, int16_t base_speed)
 {
+    Line_ConfigWithCorrectionLimits(kp, ki, kd, base_speed,
+                                    LINE_CORR_LIMIT, LINE_EDGE_MIN_CORR);
+}
+
+void Line_ConfigWithCorrectionLimits(float kp, float ki, float kd,
+                                     int16_t base_speed,
+                                     float correction_limit,
+                                     float edge_min_correction)
+{
+    if (correction_limit < 0.0f) correction_limit = -correction_limit;
+    if (edge_min_correction < 0.0f) edge_min_correction = -edge_min_correction;
+    if (edge_min_correction > correction_limit) {
+        edge_min_correction = correction_limit;
+    }
+
     PID_Init(&sPid, kp, ki, kd,
-             -LINE_CORR_LIMIT, LINE_CORR_LIMIT,
+             -correction_limit, correction_limit,
              LINE_INTEGRAL_LIMIT);
     sBaseSpeed = base_speed;
+    sCorrectionScale = 1.0f;
+    sCorrectionLimit = correction_limit;
+    sEdgeMinCorrection = edge_min_correction;
 }
 
 void Line_Start(uint32_t now_ms)
@@ -65,17 +87,22 @@ void Line_Update(uint8_t gray_map, uint32_t now_ms)
 {
     int16_t drive_base = sBaseSpeed;
 
+    if (sCorrectionScale <= 0.0f && sBaseSpeed >= MOTOR_PWM_MAX) {
+        SpeedControl_SetCommand(0, 0);
+        return;
+    }
+
     if (gray_map == 0U) {
         /* Keep searching in the last known direction through a short gap. */
         sError = sLastValidError;
         if (sLastValidError > 0.1f) {
-            sCorr = -LINE_CORR_LIMIT;
+            sCorr = -sCorrectionLimit;
         } else if (sLastValidError < -0.1f) {
-            sCorr = LINE_CORR_LIMIT;
+            sCorr = sCorrectionLimit;
         } else {
             sCorr = 0.0f;
         }
-        if (drive_base < LINE_LOST_PWM_BASE) {
+        if (sCorrectionScale >= 1.0f && drive_base < LINE_LOST_PWM_BASE) {
             drive_base = LINE_LOST_PWM_BASE;
         }
     } else {
@@ -97,23 +124,27 @@ void Line_Update(uint8_t gray_map, uint32_t now_ms)
         sCorr = PID_Compute(&sPid, pos, dt);
 
         abs_error = (sError < 0.0f) ? -sError : sError;
-        if (sError >= LINE_EDGE_ERROR && sCorr > -LINE_EDGE_MIN_CORR) {
-            sCorr = -LINE_EDGE_MIN_CORR;
+        if (sError >= LINE_EDGE_ERROR && sCorr > -sEdgeMinCorrection) {
+            sCorr = -sEdgeMinCorrection;
         } else if (sError <= -LINE_EDGE_ERROR &&
-                   sCorr < LINE_EDGE_MIN_CORR) {
-            sCorr = LINE_EDGE_MIN_CORR;
+                   sCorr < sEdgeMinCorrection) {
+            sCorr = sEdgeMinCorrection;
         }
 
         /* This PWM is inverted: a larger compare value means less drive. */
-        curve_offset = (int16_t)(abs_error * LINE_CURVE_PWM_PER_ERROR);
+        curve_offset = (int16_t)(abs_error * LINE_CURVE_PWM_PER_ERROR *
+                                 sCorrectionScale);
         if (curve_offset > LINE_CURVE_PWM_OFFSET) {
             curve_offset = LINE_CURVE_PWM_OFFSET;
         }
         drive_base += curve_offset;
     }
 
-    int16_t left  = line_clamp_pwm(drive_base + (int16_t)sCorr);
-    int16_t right = line_clamp_pwm(drive_base - (int16_t)sCorr);
+    int16_t correction = (int16_t)(sCorr * sCorrectionScale);
+    int16_t pwm_max = (sCorrectionScale < 1.0f) ?
+                      MOTOR_PWM_MAX : LINE_PWM_MAX;
+    int16_t left  = line_clamp_pwm(drive_base + correction, pwm_max);
+    int16_t right = line_clamp_pwm(drive_base - correction, pwm_max);
     SpeedControl_SetCommand(left, right);
 }
 
@@ -125,6 +156,13 @@ void Line_Stop(void)
 void Line_SetBaseSpeed(int16_t speed)
 {
     sBaseSpeed = speed;
+}
+
+void Line_SetCorrectionScale(float scale)
+{
+    if (scale < 0.0f) scale = 0.0f;
+    if (scale > 1.0f) scale = 1.0f;
+    sCorrectionScale = scale;
 }
 
 float Line_GetPosition(uint8_t gray_map)

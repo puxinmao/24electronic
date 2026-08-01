@@ -13,5 +13,6 @@ bool Button_IsPressed(GPIO_Regs *port, uint32_t pin);
 
 #define KEY1_PRESSED  Button_IsPressed(GPIO_IO_KEY1_PORT, GPIO_IO_KEY1_PIN)
 #define KEY2_PRESSED  Button_IsPressed(GPIO_IO_KEY2_PORT, GPIO_IO_KEY2_PIN)
+#define KEY3_PRESSED  Button_IsPressed(GPIO_IO_KEY3_PORT, GPIO_IO_KEY3_PIN)
 
 #endif /* BUTTON_H */

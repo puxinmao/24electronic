@@ -75,20 +75,3 @@ void DBG_Printf(const char *fmt, ...)
         DBG_SendStr(buf);
     }
 }
-
-/* ========== 外部数据 UART (UART_0, RX=PA9) ========== */
-
-void UART_RX_Init(void)
-{
-    /* SysConfig 已在 SYSCFG_DL_UART_0_init() 中完成初始化 */
-}
-
-bool UART_RX_Available(void)
-{
-    return !DL_UART_Main_isRXFIFOEmpty(UART_0_INST);
-}
-
-uint8_t UART_RX_Read(void)
-{
-    return DL_UART_Main_receiveData(UART_0_INST);
-}
