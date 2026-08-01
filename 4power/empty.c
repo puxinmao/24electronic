@@ -30,7 +30,7 @@
 #define KEY1_DECEL_PWM       MOTOR_PWM_MAX /* KEY1 减速终点；达到后两侧电机指令为零。 */
 #define KEY1_DECEL_PWM_STEP             1  /* 每个循迹周期的减速步进；值越大减速越快。 */
 
-#define KEY2_STOP_TIME_MS              7000U /* KEY2 起步后的定时停车时间。 */
+#define KEY2_STOP_TIME_MS              6500U /* KEY2 起步后的定时停车时间。 */
 #define KEY2_START_PWM                1650  /* KEY2 渐变起点；PWM 反向，值越大起步越慢。 */
 #define KEY2_START_PWM_STEP              1  /* 每个循迹周期提升的速度参数；值越大加速越快。 */
 #define KEY2_DECEL_START_MS           5000U /* KEY2 起步后开始缓慢减速的时间。 */

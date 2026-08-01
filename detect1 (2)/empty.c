@@ -30,10 +30,12 @@
 #define K230_IMAGE_HEIGHT                      (360)
 #define BALL_POSITION_LIMIT_CENTI_CM           (1250)
 #define BALL_MIN_SCORE                         (35U)
-#define BALL_DEAD_ZONE_ENTER_CM                (1.00f)
-#define BALL_DEAD_ZONE_EXIT_CM                 (1.20f)
-#define BALL_FINE_CONTROL_ZONE_CM              (1.20f)
-#define BALL_FINE_CONTROL_MAX_SPEED_RPM        (1U)
+#define BALL_DEAD_ZONE_ENTER_CM                (1.80f)
+#define BALL_DEAD_ZONE_EXIT_CM                 (2.10f)
+/* 精细控制区限速范围:须不小于死区退出值,保证球进入死区前已限速。 */
+#define BALL_FINE_CONTROL_ZONE_CM              (2.30f)
+/* 1 RPM 电机实测不转,中心区微调下限取最小可靠转速 2 RPM。 */
+#define BALL_FINE_CONTROL_MAX_SPEED_RPM        (2U)
 #define BALL_HOLD_VELOCITY_CM_S                (0.50f)
 #define BALL_OVERSHOOT_COMPENSATION_S          (0.12f)
 #define BALL_OVERSHOOT_COMPENSATION_MAX_CM     (1.50f)
@@ -57,8 +59,9 @@
 #define VISION_LOST_TIMEOUT_MS                 (250U)
 #define ZDT_MOTOR_ID                           (1U)
 #define ZDT_MOTOR_CHECKSUM                     (0x6BU)
-#define ZDT_MOTOR_MIN_SPEED_RPM                (2U)
-#define ZDT_MOTOR_MAX_SPEED_RPM                (3U)
+/* 调动幅度更大:2000 限幅下实际输出恒等于 MIN,故提高 MIN 到 3。 */
+#define ZDT_MOTOR_MIN_SPEED_RPM                (3U)
+#define ZDT_MOTOR_MAX_SPEED_RPM                (4U)
 #define ZDT_MOTOR_ACCEL_LEVEL                  (5U)
 #define ZDT_DIRECTION_RIGHT_RAISE              (0x01U)
 #define ZDT_DIRECTION_LEFT_LOWER               (0x00U)
@@ -81,7 +84,9 @@
 #define MOTOR_COMMAND_PERIOD_MS                (20U)
 #define MOTOR_HEARTBEAT_MS                     (100U)
 #define MOTOR_DIRECTION_SETTLE_MS              (20U)
-#define MOTOR_SLEW_RPM_PER_SEC                 (180U)
+/* 电机转速斜坡:每次命令的转速变化速率,越小越柔和、越大越利落。
+ * 按"调动幅度更大"要求从 60 提到 120。 */
+#define MOTOR_SLEW_RPM_PER_SEC                 (120U)
 
 /* PB21 trajectory starts from rest.  Limit only its first outward leg so the
  * initial 0 -> +5 cm setpoint step does not launch the ball too hard. */
