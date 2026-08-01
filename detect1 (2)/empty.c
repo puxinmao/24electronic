@@ -94,6 +94,11 @@
 
 #define K230_FRAME_MAX_LENGTH                  (40U)
 
+/* ---------------- 帧率/丢帧诊断输出 (UART0: PA10 TX, 115200) ------------- */
+#define FPS_REPORT_PERIOD_MS                   (1000U)
+/* 帧间隔超过该值即认为中间丢了帧,立即输出一条警告 */
+#define FRAME_INTERVAL_WARN_MS                 (150U)
+
 typedef enum {
     PIPE_LOWER = -1,
     PIPE_RAISE = 1
@@ -160,6 +165,16 @@ static TrajectoryState g_trajectory = TRAJECTORY_IDLE_CENTER;
 static uint8_t g_last_button_sample = 1U;
 static uint8_t g_stable_button_level = 1U;
 static uint32_t g_button_change_ms = 0U;
+
+/* ---- 帧率/丢帧诊断统计 (由主循环维护, UART_2 中断只改溢出计数) ---- */
+static volatile uint32_t g_uart_overrun_count = 0U;   /* UART2 RX 溢出次数 */
+static uint32_t g_report_last_ms = 0U;                /* 上次上报时刻 */
+static uint32_t g_frame_count_interval = 0U;          /* 本上报周期内帧数 */
+static uint32_t g_frame_count_total = 0U;             /* 开机以来总帧数 */
+static uint32_t g_last_frame_ms = 0U;                 /* 上一帧到达时刻 */
+static uint32_t g_max_frame_interval_ms = 0U;         /* 本周期最大帧间隔 */
+static uint32_t g_frame_interval_sum_ms = 0U;         /* 本周期帧间隔累加 */
+static uint32_t g_interval_count = 0U;                /* 本周期间隔样本数 */
 
 void SysTick_Handler(void)
 {
@@ -271,36 +286,61 @@ void UART_2_INST_IRQHandler(void)
     static char line[K230_FRAME_MAX_LENGTH];
     static uint8_t length = 0U;
     uint8_t byte;
+    uint32_t iidx;
 
-    switch (DL_UART_getPendingInterrupt(UART_2_INST)) {
-        case DL_UART_IIDX_RX:
-            while (DL_UART_Main_isRXFIFOEmpty(UART_2_INST) == false) {
-                byte = DL_UART_Main_receiveData(UART_2_INST);
-                if (byte == '$') {
-                    line[0] = '$';
-                    length = 1U;
-                } else if (length == 0U) {
-                    /* Wait for the next frame start. */
-                } else if (byte == '\r') {
-                    /* CR is optional. */
-                } else if (byte == '\n') {
-                    line[length] = '\0';
-                    parse_ball_frame(line);
-                    length = 0U;
-                } else if (length < (K230_FRAME_MAX_LENGTH - 1U)) {
-                    line[length++] = (char)byte;
-                } else {
-                    length = 0U;
+    /* 循环处理全部 pending 中断源,保证 RX 与溢出错误都不被漏掉 */
+    while ((iidx = DL_UART_getPendingInterrupt(UART_2_INST)) !=
+           DL_UART_IIDX_NO_INTERRUPT) {
+        switch (iidx) {
+            case DL_UART_IIDX_RX:
+                while (DL_UART_Main_isRXFIFOEmpty(UART_2_INST) == false) {
+                    byte = DL_UART_Main_receiveData(UART_2_INST);
+                    if (byte == '$') {
+                        line[0] = '$';
+                        length = 1U;
+                    } else if (length == 0U) {
+                        /* Wait for the next frame start. */
+                    } else if (byte == '\r') {
+                        /* CR is optional. */
+                    } else if (byte == '\n') {
+                        line[length] = '\0';
+                        parse_ball_frame(line);
+                        length = 0U;
+                    } else if (length < (K230_FRAME_MAX_LENGTH - 1U)) {
+                        line[length++] = (char)byte;
+                    } else {
+                        length = 0U;
+                    }
                 }
-            }
-            break;
-        default:
-            break;
+                break;
+            case DL_UART_IIDX_OVERRUN_ERROR:
+                /* RX FIFO 溢出:说明主循环或中断处理来不及读走数据,
+                 * 会直接导致帧内容残缺/丢帧。 */
+                g_uart_overrun_count++;
+                DL_UART_Main_clearInterruptStatus(
+                    UART_2_INST, DL_UART_MAIN_INTERRUPT_OVERRUN_ERROR);
+                break;
+            default:
+                break;
+        }
+    }
+}
+
+/* UART0 (调试口 PA10 TX/PA11 RX) 的 RX 中断被 SysConfig 使能,但本程序
+ * 只用它做 TX 输出。提供处理函数避免 NVIC 一旦使能后落入 Default_Handler
+ * 死循环,并丢弃任何意外收到的数据。 */
+void UART_0_INST_IRQHandler(void)
+{
+    while (DL_UART_Main_isRXFIFOEmpty(UART_0_INST) == false) {
+        (void)DL_UART_Main_receiveData(UART_0_INST);
     }
 }
 
 static void k230_uart_init(void)
 {
+    /* 使能 RX 溢出错误中断,用于统计丢帧 */
+    DL_UART_Main_enableInterrupt(UART_2_INST,
+                                 DL_UART_MAIN_INTERRUPT_OVERRUN_ERROR);
     NVIC_ClearPendingIRQ(UART_2_INST_INT_IRQN);
     NVIC_EnableIRQ(UART_2_INST_INT_IRQN);
 }
@@ -331,6 +371,93 @@ static uint8_t take_latest_vision(VisionSample *sample, uint32_t *last_sequence)
     sample->sequence = sequence;
     *last_sequence = sequence;
     return 1U;
+}
+
+/* ------------------- 帧率/丢帧诊断 (UART0 PA10, 115200) ------------------ */
+static void dbg_putc(char c)
+{
+    DL_UART_Main_transmitDataBlocking(UART_0_INST, (uint8_t)c);
+}
+
+static void dbg_puts(const char *text)
+{
+    while (*text != '\0') {
+        dbg_putc(*text++);
+    }
+}
+
+static void dbg_put_u32(uint32_t value)
+{
+    char buffer[11];
+    uint8_t index = 10U;
+
+    buffer[10] = '\0';
+    if (value == 0U) {
+        dbg_putc('0');
+        return;
+    }
+    while (value > 0U) {
+        buffer[--index] = (char)('0' + (value % 10U));
+        value /= 10U;
+    }
+    dbg_puts(&buffer[index]);
+}
+
+/* 每收到一帧完整 K230 帧调用一次,维护帧率与丢帧统计 */
+static void frame_stats_on_frame(uint32_t now_ms)
+{
+    uint32_t interval;
+
+    g_frame_count_interval++;
+    g_frame_count_total++;
+    if (g_last_frame_ms != 0U) {
+        interval = now_ms - g_last_frame_ms;
+        if (interval > g_max_frame_interval_ms) {
+            g_max_frame_interval_ms = interval;
+        }
+        g_frame_interval_sum_ms += interval;
+        g_interval_count++;
+        if (interval > FRAME_INTERVAL_WARN_MS) {
+            /* 帧间隔异常增大:大概率中间丢了帧或 K230 卡顿 */
+            dbg_puts("DROP? gap=");
+            dbg_put_u32(interval);
+            dbg_puts("ms\r\n");
+        }
+    }
+    g_last_frame_ms = now_ms;
+}
+
+/* 每秒输出一次: fps / 平均帧间隔 / 最大帧间隔 / RX 溢出次数 / 总帧数 */
+static void frame_stats_report(uint32_t now_ms)
+{
+    uint32_t avg_interval;
+    uint32_t overrun_now;
+
+    if ((uint32_t)(now_ms - g_report_last_ms) < FPS_REPORT_PERIOD_MS) {
+        return;
+    }
+    g_report_last_ms = now_ms;
+
+    avg_interval = (g_interval_count != 0U) ?
+                   (g_frame_interval_sum_ms / g_interval_count) : 0U;
+    overrun_now = g_uart_overrun_count;
+
+    dbg_puts("FPS:");
+    dbg_put_u32(g_frame_count_interval);
+    dbg_puts(" avg:");
+    dbg_put_u32(avg_interval);
+    dbg_puts("ms max:");
+    dbg_put_u32(g_max_frame_interval_ms);
+    dbg_puts("ms ovf:");
+    dbg_put_u32(overrun_now);
+    dbg_puts(" tot:");
+    dbg_put_u32(g_frame_count_total);
+    dbg_puts("\r\n");
+
+    g_frame_count_interval = 0U;
+    g_max_frame_interval_ms = 0U;
+    g_frame_interval_sum_ms = 0U;
+    g_interval_count = 0U;
 }
 
 /* ------------------------- asynchronous CAN motor layer -------------------- */
@@ -773,6 +900,7 @@ int main(void)
         }
 
         if (take_latest_vision(&sample, &last_sequence) != 0U) {
+            frame_stats_on_frame(now_ms);
             if ((sample.detected != 0U) && (sample.score >= BALL_MIN_SCORE)) {
                 last_valid_vision_ms = now_ms;
                 if (g_trajectory == TRAJECTORY_HOLD_STOP) {
@@ -815,5 +943,6 @@ int main(void)
         }
 
         motor_scheduler_tick(now_ms);
+        frame_stats_report(now_ms);
     }
 }

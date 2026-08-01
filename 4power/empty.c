@@ -23,11 +23,11 @@
 #define LINE_KP                     250.0f /* 循迹 PID 比例系数。 */
 #define LINE_KI                      0.0f   /* 循迹 PID 积分系数。 */
 #define LINE_KD                      3.0f   /* 循迹 PID 微分系数。 */
-#define LINE_BASE_SPEED             1400   /* 循迹基础 PWM，数值越小速度越快。 */
+#define LINE_BASE_SPEED             1380   /* 循迹基础 PWM，数值越小速度越快。 */
 #define YAW_STOP_DEGREES             360.0f  /* 累计转过一圈后停车。 */
 #define KEY1_START_PWM                1650  /* KEY1 渐变起点；PWM 反向，值越大起步越慢。 */
 #define KEY1_START_PWM_STEP              1  /* 每个循迹周期提升的速度参数；值越大加速越快。 */
-#define KEY1_DECEL_PWM       MOTOR_PWM_MAX /* KEY1 减速终点；达到后两侧电机指令为零。 */
+#define KEY1_DECEL_PWM                1900  /* KEY1 转满一圈后的极低速度保持档，不完全停车。 */
 #define KEY1_DECEL_PWM_STEP             1  /* 每个循迹周期的减速步进；值越大减速越快。 */
 
 #define KEY2_STOP_TIME_MS              6500U /* KEY2 起步后的定时停车时间。 */
@@ -199,6 +199,8 @@ int main(void)
     bool imu_seen = false;
     bool yaw_sample_valid = false;
     bool key1_decelerating = false;
+    bool key1_timer_frozen = false;
+    uint32_t key1_frozen_elapsed_ms = 0U;
     uint32_t line_lost_start_ms = 0U;
     uint32_t run_start_ms = 0U;
     uint32_t frozen_elapsed_ms = 0U;
@@ -258,6 +260,8 @@ int main(void)
             last_yaw = latest_yaw;
             accumulated_yaw_degrees = 0.0f;
             key1_decelerating = false;
+            key1_timer_frozen = false;
+            key1_frozen_elapsed_ms = 0U;
             key1_base_speed = KEY1_START_PWM;
             line_tracking = true;
             format_elapsed_time(time_line, 0U);
@@ -390,12 +394,9 @@ int main(void)
         }
 
         if (line_tracking && key1_decelerating &&
-            key1_base_speed >= KEY1_DECEL_PWM) {
-            Line_Stop();
-            frozen_elapsed_ms = now - run_start_ms;
-            line_tracking = false;
-            line_lost = false;
-            show_status(false, false, false, imu_seen, SPEED_CONTROL_FAULT_NONE);
+            key1_base_speed >= KEY1_DECEL_PWM && !key1_timer_frozen) {
+            key1_timer_frozen = true;
+            key1_frozen_elapsed_ms = now - run_start_ms;
         }
 
         if (key3_tracking && key3_stop_detected) {
@@ -437,8 +438,13 @@ int main(void)
         }
 
         if ((now - last_display_update_ms) >= SENSOR_DISPLAY_PERIOD_MS) {
-            uint32_t elapsed_ms = (line_tracking || key2_tracking || key3_tracking) ?
-                                  now - run_start_ms : frozen_elapsed_ms;
+            uint32_t elapsed_ms;
+            if (line_tracking && key1_timer_frozen) {
+                elapsed_ms = key1_frozen_elapsed_ms;
+            } else {
+                elapsed_ms = (line_tracking || key2_tracking || key3_tracking) ?
+                             now - run_start_ms : frozen_elapsed_ms;
+            }
             uint32_t lost_ms = line_lost ? now - line_lost_start_ms : 0U;
 
             last_display_update_ms = now;
